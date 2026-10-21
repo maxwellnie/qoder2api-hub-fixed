@@ -9,6 +9,28 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.6.2
+
+**BUG 问题修复**
+
+- **合并上游 v1.6.1（issue #70 排程可配置）后，窗口排程整体断裂**：我方按 UTC+8 窗口口径写的补丁被上游判定块覆盖，留下 6 处 NameError / AttributeError / TypeError：
+  - `_run_cycle` 引用未定义的 `due` -> 启动补领每次必 NameError，被 `_run_loop` 的 try 吞成日志，**启动补领静默失效**；
+  - `checkin_hours` / `keepalive_hours` / `all_hours` 三个属性在 issue #70 后已不存在 -> AttributeError；
+  - `_fired` 混用排程点 epoch 与窗口 str 键 -> `sorted()` 直接 TypeError；
+  - `_apply_schedule` 清空 `_fired` -> 面板改一次排程就丢失「本轮已补领」记忆；
+  - `_next_target` 不认窗口键 -> 同一轮窗口被重复执行；
+  - `allow_complement` 改名后引用点未跟随 -> NameError。
+- **`can_checkin()` 回到窗口口径**：上游 `_checkin_stamped_today()` 是日历日判定，早于 UTC+8 10:00 轮转点会白跑领取请求；现按 `current_checkin_window()` 的窗口起点比较，畸形日期 fail-open。
+
+**体验优化**
+
+- **新增 Linux/macOS 启动脚本**（上游只提供 .bat，此前 bat 改写的 sh 在 dash 下直接 `Bad substitution`）：
+  - `start-qoder-proxy.sh` / `start-qoder-proxy-lan.sh`：目录解析不依赖 `BASH_SOURCE`（bash 用 `BASH_SOURCE`、其余用 `$0`，裸名字再 `command -v` 反查 PATH，`while [ -L ]` 解符号链接）；四级 Python 查找（自带 python/bin/python3 -> PATH python3 -> PATH python（须真 py3）-> ~/.cache/codex-runtimes 下 python3），每级 --version 校验；
+  - `allow-firewall.sh`：自动识别 ufw / firewalld / nftables / iptables，找不到命令时回退 /usr/sbin；
+  - 结尾补 `[server exited]` 与「仅交互终端才 pause」，非交互 stdin 不阻塞。
+
+**验证**：全量 **54 suites / 1692 checks / 0 failed**；`_test_qoder.py` **669 passed / 4 skipped / 0 failed**；真实端到端：临时账号目录起网关，/health 200、启动巡检正常落盘 fired_windows: ["YYYY-MM-DD@10:00"]、next_run_time 正确。上游 _test_issue70_schedule.py 的默认签到断言同步改为 10:00（对齐窗口轮转点）。
+
 ## v1.6.1
 
 **🐛 问题修复**

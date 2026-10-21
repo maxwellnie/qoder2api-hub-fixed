@@ -58,7 +58,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
