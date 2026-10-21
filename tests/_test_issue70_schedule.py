@@ -23,8 +23,8 @@ class _Pool:
 _s = S.Scheduler(_Pool())
 
 # ---------------------------------------------------------------- 解析
-check("#70 默认签到时刻 09:00 / 21:00",
-      S.Scheduler._fmt_times(_s.checkin_times) == "09:00,21:00",
+check("#70 默认签到时刻 10:00（对齐 UTC+8 窗口轮转点，我方口径）",
+      S.Scheduler._fmt_times(_s.checkin_times) == "10:00",
       _s.checkin_times)
 check("#70 默认保活 22:00",
       S.Scheduler._fmt_times(_s.keepalive_times) == "22:00",

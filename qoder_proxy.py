@@ -4689,6 +4689,32 @@ def _flatten_content_text(content):
     return "\n".join(t for t in texts if t), images
 
 
+    if not isinstance(content, list):
+        return out
+    for piece in content:
+        if isinstance(piece, str):
+            if piece:
+                out.append({"type": "text", "text": piece})
+            continue
+        if not isinstance(piece, dict):
+            continue
+        ptype = piece.get("type") or ""
+        if ptype in ("text", "input_text", "output_text", "summary_text"):
+            txt = piece.get("text") or ""
+            if txt:
+                out.append({"type": "text", "text": txt})
+        elif ptype in ("image_url", "image", "input_image") or "image_url" in piece:
+            url = piece.get("image_url") or piece.get("url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            if not url and piece.get("data"):
+                mime = piece.get("mimeType") or piece.get("mime_type") or "image/png"
+                url = "data:%s;base64,%s" % (mime, piece["data"])
+            if url:
+                out.append({"type": "image_url", "image_url": {"url": url}})
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 写入侧暴露面削减（评估报告路线 3：历史工具结果首尾保留 + 中间省略）
 # ---------------------------------------------------------------------------

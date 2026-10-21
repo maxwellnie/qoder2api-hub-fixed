@@ -909,7 +909,6 @@ def next_checkin_window(now=None):
         boundary += datetime.timedelta(days=1)
     return int(boundary.timestamp()), boundary.strftime("%m-%d %H:%M") + "（UTC+8）"
 
-
 # ---------------------------------------------------------------------------
 # 账号级预算护栏（task-61）：常量 + 当日用量折叠
 # ---------------------------------------------------------------------------
@@ -936,6 +935,26 @@ BREAKER_COOLDOWN_MAX = 21600.0  # …封顶 6 小时
 DEGRADE_THRESHOLD = 5           # 连续未知失败达到该次数才降权
 DEGRADE_COOLDOWN = 600.0        # 首次降权窗口：10 分钟
 DEGRADE_COOLDOWN_MAX = 7200.0   # …封顶 2 小时
+
+
+def current_checkin_window(now=None):
+    """**当前这一轮**签到窗口的起点 → (epoch 秒:int, "YYYY-MM-DD" 窗口日期:str)。
+
+    窗口按 UTC+8 每日 10:00 轮转（与上一条注释同一口径，同一份边界）：
+      · 当天 10:00 之后、次日 10:00 之前 → 起点是**当天** 10:00；
+      · 当天 10:00 之前 → 起点是**前一天** 10:00（新一轮还没开，仍属上一轮）。
+
+    用途：判定「这个账号在本轮窗口里领过没有」。**不能用日历日期判**——上一轮
+    是跨日的（昨天 10:00 到今天 10:00），用日历日期会把昨天 18:00 的领取
+    当成"今天已领"，于是当天 10:00 窗口打开后不再发起领取（历史缺陷）。
+    """
+    ts = time.time() if now is None else float(now)
+    now8 = datetime.datetime.fromtimestamp(ts, _UTC8)
+    start8 = now8.replace(hour=CHECKIN_WINDOW_HOUR_UTC8, minute=0,
+                          second=0, microsecond=0)
+    if now8 < start8:
+        start8 -= datetime.timedelta(days=1)
+    return int(start8.timestamp()), start8.strftime("%Y-%m-%d")
 
 
 def _exponential_backoff(count, base, cap, offset):
@@ -2002,13 +2021,28 @@ class Account(object):
         return self._checkin_cap, self._checkin_cap_reason
 
     def can_checkin(self):
-        """今日是否还需要签到（能力由运行时探测，不再按区域硬编码）。"""
+        """**本轮窗口**是否还需要签到（能力由运行时探测，不再按区域硬编码）。
+
+        判据是「上一轮窗口起点」而不是日历日期：窗口按 UTC+8 每日 10:00 轮转，
+        上一轮跨日（昨天 10:00 → 今天 10:00）。用日历日期判会把昨天傍晚的
+        "已领取"误判成"今天已领"，导致当天 10:00 窗口打开后不再发起领取
+        （用户实测：当天 10:00 打开软件不触发自动签到）。lastCheckin 早于
+        本轮窗口起点 → 本轮还没领过 → True。
+        """
         capable, _ = self.checkin_capability()
         if capable is False:
             return False
         if not self.last_checkin:
             return True
-        return not self._checkin_stamped_today()
+        _, window_day = current_checkin_window()
+        stamped = str(self.last_checkin).split(" ")[0].split("T")[0]
+        try:
+            # 日期部分必须是合法日期：畸形值若直接拿去比较，可能得到
+            # "看起来已领"的假结论而漏领（宁可多发一次幂等请求，不要漏领）
+            time.strptime(stamped, "%Y-%m-%d")
+        except (ValueError, TypeError):
+            return True
+        return stamped < window_day
 
     def checkin_status(self):
         """GET daily-check-in/status -> (ok, summary|error)。

@@ -3295,9 +3295,12 @@ check("Scheduler：state.json 落在账号目录的子目录，且不会被 Acco
       and _state_path28 == os.path.join(_tmp28, "scheduler", "state.json")
       and _state_exists28 and _accounts28 == [],
       (_sched_err28, _state_path28, len(_accounts28)))
-check("Scheduler：mark-before-act——首次启动补签返回 True，且当日标记已先落盘",
+# 标记口径已从"日历日"改为"本轮签到窗口"（UTC+8 每日 10:00 轮转的跨日窗口）：
+# 同一天 10:00 前后属于**不同的两轮**，用日历日会把 10:00 那轮误判成"已补签"。
+check("Scheduler：mark-before-act——首次启动补签返回 True，且本轮窗口标记已先落盘",
       _gate_first28 is True
-      and _state_json28.get("startup_claim_date") == _t28.strftime("%Y-%m-%d"),
+      and str(_state_json28.get("startup_claim_date") or "").startswith(
+          _t28.strftime("%Y-%m-%d")),
       _state_json28.get("startup_claim_date"))
 check("Scheduler：同一天第二次启动补签被闸门拒绝（False）",
       _gate_second28 is False, _gate_second28)
