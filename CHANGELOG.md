@@ -53,6 +53,10 @@
   对应 tests/_test_web_tools.py 24 条。同时上游 v1.4.0 起容器强制 --lan + 强制随机 Key、
   v1.5.13 一键更新边界（面板会话 + 默认仅本机 + 容器内默认拒绝 + 解压穿越防护）、
   v1.5.0 面板会话 token 自校验签名，均随合并获得。
+- **一键更新指向**：qoder_updater.py:27 `REPO` 改为可用环境变量 `QD_UPDATE_REPO` 覆盖
+  （默认仍是上游 `shuishuipingan/qoder2api-hub`）。fork 用户把自己仓库写进启动脚本的
+  环境变量，一键更新才会拉到本 fork 的 release，否则会把窗口排程补丁覆盖成上游版。
+
 - **运行时数据隔离**：accounts/settings.json 等运行残留已从源码目录清除，accounts/README.txt
   入库作占位；.gitignore 维持 accounts/* 白名单放行 README.txt。
 

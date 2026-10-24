@@ -24,7 +24,9 @@ import threading
 import time
 import urllib.request
 
-REPO = "shuishuipingan/qoder2api-hub"
+# 上游仓库默认值。fork 用户用环境变量 QD_UPDATE_REPO 指向自己的仓库，
+# 否则一键更新会去读上游 releases/latest，把本地补丁覆盖成上游版。
+REPO = os.environ.get("QD_UPDATE_REPO") or "shuishuipingan/qoder2api-hub"
 TARBALL_URL = "https://github.com/%s/archive/refs/tags/%s.tar.gz" % (REPO, "%s")
 
 PROTECTED_TOP = {
