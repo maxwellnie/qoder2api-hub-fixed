@@ -13,6 +13,10 @@ services:
     # ⚠️ 要用的话请换成你自己生成的，别照抄——macvlan / 同一宿主机多实例会撞 MAC：
     #    printf '02:42:%02x:%02x:%02x:%02x\n' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256))
     # mac_address: "02:42:ac:11:00:77"
+    # 固定主机名（**可选**）：签到请求的 Cosy-MachineHostname 与官方桌面端一样取本机
+    # hostname，容器默认是容器 ID，每次重建都会变。想固定就填一个**你自己的**名字，
+    # 别照抄示例（所有人用同一个名字反而成了共同指纹）。
+    # hostname: my-nas
     ports:
       # 宿主机:容器。改容器监听端口时 PORT 与这里要一起改
       - "8790:8790"

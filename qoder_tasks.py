@@ -12,8 +12,10 @@
 """
 import sys
 import threading
+import random
 import time
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import qoder_accounts
 from qoder_accounts import get_realm_config
 
@@ -397,6 +399,21 @@ def _campaign_task_row(account, camp, summary):
             "活动定向内、虚拟机环境、试用资格已用尽/冻结；详见 docs/accounts.md「官方活动规则」）")
     if camp.get("show_campaign"):
         desc = "活动进行中，当前账号暂无可领取项"
+    else:
+        # issue: 国际版签不到到时**必须给出原因**，否则只看到「没有活动」。
+        # 服务端以 showCampaign=false 隐藏列表，最常见的两块：机器身份 / 定向。
+        _mh = str(camp.get("machine_headers") or "")
+        _id = str(camp.get("identity") or "derived")
+        if _mh == "omitted":
+            desc = ("活动列表被上游隐藏（showCampaign=false）：当前**没有可用的原生"
+                    "机器身份**（identity=%s，机器头=omitted）。国际版需要官方桌面端"
+                    "同款设备身份，请安装 UMID 组件后重试："
+                    "`python _install_umid.py --platform linux`（或挂载 umid/ 目录），"
+                    "见 docs/accounts.md。" % _id)
+        else:
+            desc = ("活动列表被上游隐藏（showCampaign=false，identity=%s）：账号可能不在"
+                    "活动定向内，或当前出口 IP 被风控。详见 docs/accounts.md「官方活动规则」。"
+                    % _id)
     return {
         "task_code": "daily_checkin",
         "name": "每日签到（每日领取 Credits）",
@@ -756,10 +773,22 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
             logs.append("🔒 [%s] %s：需先在官方桌面端完成新人任务（成就 %s）"
                         % (name, qoder_accounts.campaign_label(item),
                            item.get("required_achievement_key") or "?"))
-        time.sleep(settle)
-        if account.fetch_credits().get("ok"):
-            logs.append(f"  当前额度余额: {account.credits.get('remain', 0)}")
-        account.fetch_plan()
+        # 余额与套餐并行刷新（各 ~1.2s，串行会白白多等一个 RTT）；
+        # 两者都是 best-effort，失败不影响签到结论。
+        if settle > 0:
+            time.sleep(min(settle, 0.3))
+        with ThreadPoolExecutor(max_workers=2) as _pool:
+            _fc = _pool.submit(account.fetch_credits)
+            _fp = _pool.submit(account.fetch_plan)
+            try:
+                if _fc.result(timeout=20).get("ok"):
+                    logs.append(f"  当前额度余额: {account.credits.get('remain', 0)}")
+            except Exception:
+                pass
+            try:
+                _fp.result(timeout=20)
+            except Exception:
+                pass
         # 活动平台的结论字段**原样带出**（供 /accounts/checkin 的 result 项透传到
         # 前端）：只带出、不改写语义，proxy 的 msg 仍取 logs 尾行。
         #   message             活动平台结论文本（campaign_checkin 的 message）
@@ -863,26 +892,70 @@ def run_pro_claim(account):
 # ---------------------------------------------------------------------------
 # 批量：看板「一键签到领积分」/「领取福利包」
 # ---------------------------------------------------------------------------
+def _checkin_workers():
+    try:
+        return max(1, min(8, int(os.environ.get("QD_CHECKIN_CONCURRENCY") or 3)))
+    except Exception:
+        return 3
+
+
 def run_batch_checkin(targets, gap=1.0, inter_gap=1.5):
-    """批量签到。返回 {ok, logs, credit_added, accounts_count}。"""
-    combined, total, done = [], 0, 0
-    for i, acc in enumerate(targets):
+    """批量签到（并发执行）。返回 {ok, logs, credit_added, accounts_count}。
+
+    为什么并发：签到是「每账号一次上游往返」，串行时 5 个账号要等 5 个 RTT +
+    5 次 inter_gap（旧默认 1.5s），面板上就是「点了半天没反应」。现在默认
+    3 个并发（`QD_CHECKIN_CONCURRENCY` 可调 1–8），并在每个账号启动前加
+    0~0.8s 抖动，避免同一秒打同一上游形成机器枪特征。
+
+    日志仍按**账号顺序**输出（与并发无关），保证可读。
+    """
+    accounts = [a for a in (targets or []) if a is not None]
+    if not accounts:
+        return {"ok": False, "logs": ["没有可签到的账号"],
+                "credit_added": 0, "accounts_count": 0}
+    total = 0
+    done = 0
+    blocks = [None] * len(accounts)
+
+    def _one(idx, acc):
+        # 抖动：**只给非首个任务**加 0~0.3s 错开，避免同一毫秒打上游；
+        # 首个任务立即开始（否则 N 个任务各抖 0.8s，反而比串行还慢）。
+        if idx:
+            try:
+                time.sleep(random.uniform(0, 0.3))
+            except Exception:
+                pass
         nick = acc.nickname or acc.uid[:8]
-        combined.append("====== 正在为账号 [%s (%s)] 执行每日签到 (%d/%d) ======"
-                        % (nick, acc.uid, i + 1, len(targets)))
         res = run_checkin(acc, gap=gap)
-        total += res.get("earned_credit") or 0
-        done += 1 if res.get("ok") else 0
-        for line in res.get("logs") or []:
-            combined.append("  " + line)
-        if i < len(targets) - 1:
-            time.sleep(inter_gap)
-    combined.append("====== 全部 %d 个账号签到完毕，累计新增积分: +%d ======"
-                    % (len(targets), total))
+        lines = ["====== 正在为账号 [%s (%s)] 执行每日签到 (%d/%d) ======"
+                 % (nick, acc.uid, idx + 1, len(accounts))]
+        lines.extend("  " + str(x) for x in (res.get("logs") or []))
+        return res, lines
+
+    workers = _checkin_workers()
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_one, i, acc): i
+                   for i, acc in enumerate(accounts)}
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            try:
+                res, lines = fut.result()
+            except Exception as exc:
+                res, lines = ({"ok": False}, ["! 签到异常: %s" % exc])
+            blocks[idx] = lines
+            total += int(res.get("earned_credit") or 0)
+            done += 1 if res.get("ok") else 0
+
+    combined = []
+    for block in blocks:
+        if block:
+            combined.extend(block)
+    combined.append("====== 全部 %d 个账号签到完毕（并发 %d），累计新增积分: +%d ======"
+                    % (len(accounts), workers, total))
     for line in combined:
         _log(line)
     return {"ok": done > 0, "logs": combined, "credit_added": total,
-            "accounts_count": len(targets)}
+            "accounts_count": len(accounts)}
 
 
 def run_batch_pro_claim(targets, gap=1.0, inter_gap=1.5):

@@ -27,11 +27,13 @@
 
 | 项 | 值 |
 |---|---|
-| `cosy-version` | `1.1.64` |
-| 桌面客户端版本（签到请求头中使用） | `0.4.3`，可用 `QD_DESKTOP_VERSION` 覆盖 |
+| `cosy-version` | `1.1.75`，可用 `QD_COSY_VERSION` 覆盖 |
+| 推理 / 模型列表的 User-Agent | `undici`（官方 CLI 不设 UA，由其 HTTP 库补默认值） |
+| 桌面客户端版本（签到请求头中使用） | `0.4.8`，可用 `QD_DESKTOP_VERSION` 覆盖 |
+| 签到 / 活动请求头 | 与官方桌面端一致：`Accept: application/json`、`User-Agent: Qoder`、`Authorization`、`Cosy-ClientType: 10`、`Cosy-Version`，有真实身份时再带 `Cosy-Machine*`（主机名取本机 hostname）；领取请求另带 `Content-Type` |
 | 国内版推理主机 | `gateway.qoder.com.cn` |
 | 国际版推理主机 | `api3.qoder.sh`，传输失败时依次切换到 `api2` / `api1`（与官方客户端的候选顺序一致，可用 `QD_INTL_GATEWAY` 覆盖） |
-| 账号接口的 User-Agent | 国内版 `QoderWork/1.1.64`，国际版 `Qoder/1.1.64` |
+| 账号接口的 User-Agent | 国内版 `QoderWork/1.1.75`，国际版 `Qoder/1.1.75` |
 | `X-Request-ID` | 每个请求纯随机的 32 位 hex |
 
 所有密码学算法（AES-128/256、GCM、RSA-PKCS1v15、DPAPI、QMC 解密）都在 `qoder_sign.py` 中用纯 Python 实现，因此在 alpine 容器中也不需要额外依赖。
@@ -47,14 +49,14 @@
 
 获取真实机器身份：
 
-- **Windows**：直接调用桌面客户端自带的 `runtime-info.exe`
+- **Windows**：优先调用桌面客户端自带的 `runtime-info.exe`；没装桌面客户端时，可用 `_install_umid.py` 提取 `runtime-info.exe` + `sgsdk.dll`
 - **Linux / macOS**：用 `_install_umid.py` 从官方 npm 包中提取组件（Docker 镜像构建时已经提取好）
 
 首次获取时会多次采样，取多数结果，避免身份落在官方虚拟机检测结果偶尔跳变的少数分支上；结果缓存在 `accounts/machine_identity.json`。如果服务端不认可当前身份，网关会清除组件的种子文件，重新获取一个新身份。
 
 签到 / 活动链路只有拿到真实身份时，才会发送 `Cosy-MachineToken` 等机器身份请求头。实测发送派生的假身份，反而会让「每日领取」活动被整条过滤掉。
 
-推理请求另外携带 `cosy-machineos` 和 `cosy-machinehostname`，与官方客户端的 infer-sse 请求一致。其中主机名按账号稳定派生，不同账号互不相同；`QD_COSY_OS_HEADERS=0` 可以关闭。
+推理与模型列表请求都携带 `cosy-machineos`，推理（infer-sse）请求另带 `cosy-machinehostname`，与官方客户端一致。其中主机名按账号稳定派生，不同账号互不相同；`QD_COSY_OS_HEADERS=0` 可以关闭。
 
 ## 账号调度与容错
 

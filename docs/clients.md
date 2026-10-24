@@ -103,3 +103,27 @@ python qoder_agents.py restore --client dsh                    # 还原
 ```
 
 `--client` 可选：`claude-code`、`codex`、`opencode`、`dsh`、`crush`。
+
+
+## 接入 new-api / one-api 等聚合网关
+
+聚合网关把我们当成一个 OpenAI 兼容渠道，最常见的三类失败都在**地址填写**上：
+
+| 现象（聚合网关侧） | 原因 | 正确写法 |
+|---|---|---|
+| `do_request_failed` / 连接超时 | 地址不可达（容器内 `127.0.0.1` 指向容器自己） | 用宿主 IP 或 `host.docker.internal`，端口默认 8790 |
+| 404 `not found: /v1/v1/chat/completions` | base URL 已带 `/v1`，客户端又拼一次 | 只填 `http://<host>:8790`（不带 `/v1`） |
+| 401 `api key required` | 渠道 Key 与本网关的 Key 不一致 | 面板「设置 → API Key」复制，或用 `QD_API_KEY` |
+
+自检顺序（在**聚合网关所在容器**里执行）：
+
+```bash
+curl -s http://<host>:8790/ping            # 期望 pong
+curl -s http://<host>:8790/v1/models        # 期望 JSON 列表（无 Key 时 401 也算通）
+curl -s -X POST http://<host>:8790/v1/chat/completions      -H 'Authorization: Bearer <KEY>' -H 'Content-Type: application/json'      -d '{"model":"DeepSeek-Flash","messages":[{"role":"user","content":"hi"}]}'
+```
+
+如果第一条就失败，是本机网络/端口问题（不是网关逻辑）；三条都通但聚合网关仍报错，请把网关访问日志里的对应行发出来。
+
+本网关对**重复 `/v1` 前缀**会返回带提示的 404，并在日志里记一条 WARN，便于自证。
+

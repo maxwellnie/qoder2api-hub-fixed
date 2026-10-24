@@ -131,6 +131,30 @@ def main(argv):
     env["PYTHONIOENCODING"] = "utf-8"
     if not shutil.which("node"):
         env.pop("NODE_OK", None)
+    # 测试用量目录：所有套件都走临时目录，一个字节都不写仓库的 usage/。
+    # 这里是**唯一能可靠覆盖所有套件**的地方 —— 有些套件（_test_model_gates /
+    # _test_anthropic_wiring / _test_failure_families / _test_credits_guard）
+    # 绕过 bootstrap() 自己 import qoder_proxy，靠 _suite_head 的 setdefault
+    # 管不到它们，必须由 runner 直接注入环境变量。
+    _acc_usage = os.path.join(ROOT, "_acc", "usage")
+    env.setdefault("QD_PROXY_USAGE_DIR", _acc_usage)
+    # issue #87：测试里的本机 HTTP 不能被系统代理劫持。开发机常设
+    # HTTP(S)_PROXY（如 127.0.0.1:7897），一旦带上，套件对 127.0.0.1 的请求会
+    # 走代理并被回 502 —— 表现为「整批套件莫名全红」，而真实代码没问题。
+    # 这里在**子进程环境**里统一清掉（个别套件需要时会自己 set）。
+    for _k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+               "http_proxy", "https_proxy", "all_proxy",
+               "NO_PROXY", "no_proxy"):
+        env.pop(_k, None)
+    # 跑前清一次：套件每次请求都会 append 一行，不清则越跑越大。
+    # 只删隔离区，真实用量在 <ROOT>/usage，绝不被碰。
+    # 不用 ignore_errors：Windows 上杀软/残留句柄导致的 PermissionError 会被
+    # 吞掉，目录没清却看着「清过了」。清不掉就直说。
+    if os.path.isdir(_acc_usage):
+        try:
+            shutil.rmtree(_acc_usage)
+        except OSError as exc:
+            print("  [warn] could not clear %s: %s" % (_acc_usage, exc))
     with _cf.ThreadPoolExecutor(max_workers=jobs) as ex:
         results = list(ex.map(lambda n: run_one(n, logdir, env), selected))
     failed = []

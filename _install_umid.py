@@ -6,7 +6,8 @@ Qoder 官方风控身份桥 runtime-info 在 Windows 上来自已安装的桌面
 （<install>/resources/umid/runtime-info.exe）。Linux / macOS / Docker / WSL
 没有该文件，网关此前只能退化为派生假身份（derived）——而 issue #10 实测证明
 "发送全套派生 cosy-machine* 头"会被服务端判定为非官方客户端，把 CLAIMABLE
-的「每日领取 100 Credits」整条过滤。本脚本让 POSIX 环境也能拿到真身份。
+的「每日领取 100 Credits」整条过滤。本脚本让 POSIX 环境也能拿到真身份；
+没装桌面客户端的 Windows 也可用它提取 runtime-info.exe + sgsdk.dll。
 
 组件来源与提取原理
 ──────────────────
@@ -19,16 +20,20 @@ package/bundle/qoder-worker-runtime.mjs 内嵌多个平台的原生组件，以�
   4. 按魔数识别格式/架构（ELF e_machine / Mach-O cputype / WASM / PE），
      **不按出现顺序硬编码索引**（上游结构随时可能调整）；
   5. 选出与目标平台/架构匹配的组件，校验后原子写入安装目录
-     （默认 <repo>/umid/runtime-info，可用 --dest 或 $QD_UMID_DIR 覆盖），chmod 755。
+     （默认 <repo>/umid/runtime-info，Windows 为 runtime-info.exe + sgsdk.dll；
+     可用 --dest 或 $QD_UMID_DIR 覆盖），chmod 755。
 
-实测对照（qodercli 1.1.65，仅作注释记录，不参与选择逻辑）：
+实测对照（qodercli 1.1.65 / 1.1.75 相同，仅作注释记录，不参与选择逻辑）：
   blob[3] Mach-O arm64 1,026,912 B；blob[4] Mach-O x86_64 992,624 B；
   blob[5] ELF x86-64 652,488 B；blob[6] ELF aarch64 660,624 B；
-  blob[7] PE x86-64 480,752 B；blob[8] PE x86-64 7,354,928 B；其余为 WASM。
+  blob[7] PE x86-64 480,752 B（runtime-info.exe）；
+  blob[8] PE x86-64 7,354,928 B（sgsdk.dll，带 IMAGE_FILE_DLL 标志位）；其余为 WASM。
 
-调用契约（与 Windows 桌面端 runtime-info.exe 完全一致）
-────────────────────────────────────────────────────
-    printf '{"account":"<uid>"} ' | runtime-info prod --account-stdin
+调用契约（官方桌面端 0.4.8 / qodercli 1.1.75 一致；环境码见下）
+────────────────────────────────────────────────────────────
+    runtime-info <env>                                              # linux
+    printf '{"account":"<uid>"}\\n' | runtime-info <env> --account-stdin  # darwin / win32
+env：国内版 0；国际版桌面端 3、CLI 4（网关的活动链路按桌面端传 3）。
 输出 JSON：{machineToken, machineType, machineCode, vmInfo, ...}
 
 【重要 · 已知限制】机器身份是机器级的，无法按账号拆分
@@ -43,7 +48,7 @@ package/bundle/qoder-worker-runtime.mjs 内嵌多个平台的原生组件，以�
 
 用法
 ────
-    python _install_umid.py                                # 当前平台（win32 只提示）
+    python _install_umid.py                                # 当前平台（linux / darwin / win32）
     python _install_umid.py --platform linux --arch x64    # 为 WSL / Docker 提取
     python _install_umid.py --platform linux --dry-run     # 只识别不落盘（仍会下载）
 """
@@ -72,7 +77,7 @@ TARGET_FILENAME = "runtime-info"
 DEFAULT_DEST_DIRNAME = "umid"
 
 # 同一目标出现多个候选时，优先选体积落在该区间的组件（实测 480KB–1MB 的都是
-# 真 runtime-info；7.3MB 的 PE 疑似其它原生模块，需避开）
+# 真 runtime-info；7.3MB 的 PE 是 Windows 的 sgsdk.dll，另按 DLL 标志位区分）
 HEURISTIC_SIZE_MIN = 400 * 1024
 HEURISTIC_SIZE_MAX = 2 * 1024 * 1024
 
@@ -83,6 +88,7 @@ MACHO_MAGIC_64_LE = b"\xcf\xfa\xed\xfe"   # 64 位小端 Mach-O
 MACHO_CPU_X86_64 = 0x01000007
 MACHO_CPU_ARM64 = 0x0100000C
 WASM_MAGIC = b"\x00asm"
+PE_IMAGE_FILE_DLL = 0x2000              # IMAGE_FILE_HEADER.Characteristics: DLL
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +163,7 @@ def component_for_platform(platform_name, machine):
 
     platform_name: sys.platform 风格（"linux" / "darwin" / "win32"）
     machine:       platform.machine() 风格（x86_64 / AMD64 / aarch64 / arm64）
-    win32 一律返回 None（Windows 走官方桌面客户端路径，本轮不提取）。
+    win32 返回 None（Windows 需要 exe + dll 两个文件，由 select_win32_pair 处理）。
     """
     p = (platform_name or "").strip().lower()
     m = (machine or "").strip().lower()
@@ -175,6 +181,18 @@ def component_for_platform(platform_name, machine):
 def verify_component(data, expected):
     """组件 bytes 是否与期望标签一致（魔数 + 架构级校验）。"""
     return bool(data) and identify_blob(data) == expected
+
+
+def is_pe_dll(data):
+    """检查 PE 镜像 COFF 头 Characteristics 是否带 IMAGE_FILE_DLL (0x2000) 标志位。"""
+    if identify_blob(data) not in ("pe-x86_64", "pe-aarch64"):
+        return False
+    try:
+        off = struct.unpack_from("<I", data, 0x3C)[0]
+        chars = struct.unpack_from("<H", data, off + 22)[0]
+        return bool(chars & PE_IMAGE_FILE_DLL)
+    except Exception:
+        return False
 
 
 def select_candidate(candidates, expected):
@@ -196,6 +214,22 @@ def select_candidate(candidates, expected):
     return hits[0]
 
 
+def select_win32_pair(candidates):
+    """从候选里选出 Windows 的 (runtime-info.exe, sgsdk.dll) 二元组。"""
+    pe_hits = [(i, blob) for i, (_s, _e, blob) in enumerate(candidates)
+               if identify_blob(blob) == "pe-x86_64"]
+    exe_cands = [h for h in pe_hits
+                 if not is_pe_dll(h[1])
+                 and HEURISTIC_SIZE_MIN <= len(h[1]) <= HEURISTIC_SIZE_MAX]
+    dll_cands = [h for h in pe_hits
+                 if is_pe_dll(h[1]) and len(h[1]) > HEURISTIC_SIZE_MAX]
+    if not exe_cands or not dll_cands:
+        return None
+    exe_cands.sort(key=lambda h: len(h[1]))
+    dll_cands.sort(key=lambda h: len(h[1]), reverse=True)
+    return exe_cands[0], dll_cands[0]
+
+
 def is_installed(path, expected):
     """目标文件已存在且校验通过（幂等判定）。"""
     try:
@@ -204,6 +238,19 @@ def is_installed(path, expected):
     except OSError:
         return False
     return verify_component(data, expected)
+
+
+def win32_pair_installed(exe_path, dll_path):
+    """Windows 双文件已存在且校验通过（exe 无 DLL 标志位、dll 有）。"""
+    try:
+        with open(exe_path, "rb") as fh:
+            exe = fh.read()
+        with open(dll_path, "rb") as fh:
+            dll = fh.read()
+    except OSError:
+        return False
+    return (verify_component(exe, "pe-x86_64") and not is_pe_dll(exe)
+            and verify_component(dll, "pe-x86_64") and is_pe_dll(dll))
 
 
 def verify_integrity(data, integrity):
@@ -245,7 +292,7 @@ def resolve_tarball(registry_url=REGISTRY_URL, timeout=60.0):
     dist = entry.get("dist") or {}
     url = str(dist.get("tarball") or "")
     if not url:
-        raise RuntimeError("npm 元数据里没有 dist.tarball（version=%r）" % version)
+        raise RuntimeError("npm 元数据缺少 dist.tarball（version=%r）" % version)
     return version, url, str(dist.get("integrity") or "")
 
 
@@ -288,10 +335,35 @@ def extract_runtime_bundle(tgz_bytes):
     raise RuntimeError("tarball 里找不到 %s（上游包结构可能已变化）" % BUNDLE_MEMBER)
 
 
-def install(data, dest_dir, log=print):
-    """原子写入 <dest_dir>/runtime-info 并 chmod 755；返回目标路径。"""
+def fetch_candidates():
+    """下载 npm 包并校验 sha512，返回 bundle 里的候选组件；校验失败返回 None。"""
+    version, url, integrity = resolve_tarball()
+    print("npm 包  ：@qoder-ai/qodercli@%s" % version)
+    print("下载源  ：%s" % url)
+    tgz = download_tarball(url)
+    print("下载完成：%.1f MB" % (len(tgz) / 1e6))
+
+    integrity_ok = verify_integrity(tgz, integrity)
+    if integrity_ok is False:
+        print("错误：tarball 的 sha512 校验失败，中止（可能下载损坏或被篡改）")
+        return None
+    if integrity_ok is None:
+        print("提示：npm 元数据缺少可用的 integrity，跳过包校验。")
+
+    text = extract_runtime_bundle(tgz)
+    print("bundle  ：%s（%.1f MB），扫描 >= %d 字符的 base64 字面量…"
+          % (BUNDLE_MEMBER, len(text) / 1e6, BLOB_MIN_LEN))
+    candidates = scan_bundle_candidates(text)
+    print("候选 %d 个：" % len(candidates))
+    for i, (_start, _end, blob) in enumerate(candidates):
+        print("  [%2d] %10d B  %s" % (i, len(blob), identify_blob(blob)))
+    return candidates
+
+
+def install(data, dest_dir, log=print, filename=TARGET_FILENAME):
+    """原子写入 <dest_dir>/<filename> 并 chmod 755；返回目标路径。"""
     os.makedirs(dest_dir, exist_ok=True)
-    target = os.path.join(dest_dir, TARGET_FILENAME)
+    target = os.path.join(dest_dir, filename)
     tmp = target + ".tmp"
     with open(tmp, "wb") as fh:
         fh.write(data)
@@ -309,7 +381,7 @@ def main(argv=None):
         epilog="机器身份是机器级的：同一台机器上的多个账号不能借此各自领到"
                "（服务端按设备去重），详见模块 docstring。")
     parser.add_argument("--platform", default=sys.platform,
-                        help="目标平台：linux / darwin（默认当前；win32 只提示不提取）")
+                        help="目标平台：linux / darwin / win32（默认当前平台）")
     parser.add_argument("--arch", default=None,
                         help="目标架构：x64 / arm64（默认当前机器架构）")
     parser.add_argument("--dest", default=None,
@@ -323,48 +395,50 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     plat = (args.platform or "").strip().lower()
-    if plat.startswith("win"):
-        print("提示：Windows 平台无需提取——官方桌面客户端自带")
-        print("      <install>/resources/umid/runtime-info.exe，网关会优先使用它。")
-        print("      若要为 WSL / Docker 准备 Linux 组件，请加 --platform linux。")
-        return 2
-
     machine = args.arch or _platform.machine()
+    dest_dir = args.dest or default_dest_dir()
+    if plat.startswith("win"):
+        exe_target = os.path.join(dest_dir, "runtime-info.exe")
+        dll_target = os.path.join(dest_dir, "sgsdk.dll")
+        print("目标组件：pe-x86_64 双文件（runtime-info.exe + sgsdk.dll）")
+        print("安装路径：%s, %s" % (exe_target, dll_target))
+        if (not args.force and not args.dry_run
+                and win32_pair_installed(exe_target, dll_target)):
+            print("已就绪：现有文件校验通过，跳过下载（--force 可强制重装）。")
+            return 0
+        candidates = fetch_candidates()
+        if candidates is None:
+            return 1
+        pair = select_win32_pair(candidates)
+        if pair is None:
+            print("错误：bundle 里未找齐 Windows runtime-info.exe + sgsdk.dll")
+            return 1
+        (exe_idx, exe_blob), (dll_idx, dll_blob) = pair
+        print("选中    ：[%d] runtime-info.exe (%d B), [%d] sgsdk.dll (%d B)"
+              % (exe_idx, len(exe_blob), dll_idx, len(dll_blob)))
+        if args.dry_run:
+            print("dry-run ：不落盘；实际执行时会写入 %s, %s" % (exe_target, dll_target))
+            return 0
+        install(exe_blob, dest_dir, filename="runtime-info.exe")
+        install(dll_blob, dest_dir, filename="sgsdk.dll")
+        print("完成    ：%s, %s" % (exe_target, dll_target))
+        return 0
+
     expected = component_for_platform(plat, machine)
     if not expected:
         print("错误：不支持的平台/架构组合：%s / %s" % (plat, machine))
-        print("      支持：linux+x64、linux+arm64、darwin+x64、darwin+arm64")
+        print("      支持：linux+x64、linux+arm64、darwin+x64、darwin+arm64、win32+x64")
         return 1
-
-    dest_dir = args.dest or default_dest_dir()
     target = os.path.join(dest_dir, TARGET_FILENAME)
     print("目标组件：%s（%s / %s）" % (expected, plat, machine))
     print("安装路径：%s" % target)
-
     if not args.force and not args.dry_run and is_installed(target, expected):
         print("已就绪：现有文件校验通过，跳过下载（--force 可强制重装）。")
         return 0
 
-    version, url, integrity = resolve_tarball()
-    print("npm 包  ：@qoder-ai/qodercli@%s" % version)
-    print("下载源  ：%s" % url)
-    tgz = download_tarball(url)
-    print("下载完成：%.1f MB" % (len(tgz) / 1e6))
-
-    integrity_ok = verify_integrity(tgz, integrity)
-    if integrity_ok is False:
-        print("错误：tarball 的 sha512 校验失败，中止（可能下载损坏或被篡改）")
+    candidates = fetch_candidates()
+    if candidates is None:
         return 1
-    if integrity_ok is None:
-        print("提示：npm 元数据缺少可用的 integrity，跳过包校验。")
-
-    text = extract_runtime_bundle(tgz)
-    print("bundle  ：%s（%.1f MB），扫描 >= %d 字符的 base64 字面量…"
-          % (BUNDLE_MEMBER, len(text) / 1e6, BLOB_MIN_LEN))
-    candidates = scan_bundle_candidates(text)
-    print("候选 %d 个：" % len(candidates))
-    for i, (_start, _end, blob) in enumerate(candidates):
-        print("  [%2d] %10d B  %s" % (i, len(blob), identify_blob(blob)))
 
     if args.pick is not None:
         if not 0 <= args.pick < len(candidates):

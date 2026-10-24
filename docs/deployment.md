@@ -15,7 +15,8 @@
 |---|---|---|
 | `start-qoder-proxy.bat [端口]` | Windows | 后台分离运行。可以关掉启动窗口，日志写入 `qoder-proxy.log` / `qoder-proxy.err.log` |
 | `stop-qoder-proxy.bat` | Windows | 按 `qoder-proxy.pid` 停止。只停命令行里含 `qoder_proxy.py` 的那个进程，不会误杀其他 Python |
-| `./start-qoder-proxy.sh [端口]` | Linux / macOS | 前台运行，终端就是进程的生命周期，`Ctrl+C` 或关闭终端即停止 |
+| `./start-qoder-proxy.sh [端口]` | Linux / macOS | 前台运行，终端就是进程的生命周期，`Ctrl+C` 或关闭终端即停止；同时写 `qoder-proxy.pid` |
+| `./stop-qoder-proxy.sh [端口]` | Linux / macOS | 按 `qoder-proxy.pid` 停止（先 TERM，10s 不退再 KILL）。只停命令行里含 `qoder_proxy.py` 的那个进程；pid 文件缺失时按「进程名 + --port」兜底，不会误杀编辑器或另一份检出 |
 
 默认端口是 **8790**，要改就在后面跟端口号，例如 `start-qoder-proxy.bat 8791`。Linux / macOS 首次使用前先执行 `chmod +x *.sh`。
 
@@ -154,7 +155,8 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 | 部署方式 | 升级步骤 |
 |---|---|
 | **一键更新（源码部署）** | 看板「运行信息」→ 有新版本时点 **一键更新**，见下 |
-| 源码（手动） | `git pull`，然后重启网关（Windows 先运行 `stop-qoder-proxy.bat`，再运行 `start-qoder-proxy.bat`） |
+| 源码（手动） | `git pull`，然后重启网关：Windows 先 `stop-qoder-proxy.bat` 再 `start-qoder-proxy.bat`；
+Linux / macOS 先 `./stop-qoder-proxy.sh` 再 `./start-qoder-proxy.sh`（常驻/launchd 场景直接 restart 也可） |
 | Docker | `docker compose pull && docker compose up -d` |
 
 各版本的变更见[更新日志](../CHANGELOG.md)。

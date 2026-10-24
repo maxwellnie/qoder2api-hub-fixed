@@ -31,7 +31,185 @@
 
 **验证**：全量 **54 suites / 1692 checks / 0 failed**；`_test_qoder.py` **669 passed / 4 skipped / 0 failed**；真实端到端：临时账号目录起网关，/health 200、启动巡检正常落盘 fired_windows: ["YYYY-MM-DD@10:00"]、next_run_time 正确。上游 _test_issue70_schedule.py 的默认签到断言同步改为 10:00（对齐窗口轮转点）。
 
+## v1.7.2
+
+**合并上游 v1.7.1，保留本 fork 的窗口排程补丁**
+
+- **合并范围**：上游 v1.6.2 → v1.7.1 全量合入（27 commits / 56 files），含数据看板重做、账号独立页、
+  产品化视觉层、qoder_activity.py / qoder_pricing.py / qoder_webtools.py 三个新模块、
+  docs/ 10 篇、scripts/ 2 个诊断脚本、.github/workflows 双工作流、约 20 个新测试套件。
+- **保留本 fork 的 UTC+8 窗口口径**（上游 scheduler 未变，零冲突直接沿用）：
+  - qoder_scheduler.py：窗口排程 + fired_windows 键空间统一（相对上游 v1.6.1 差 293 行）；
+  - qoder_accounts.py：current_checkin_window() + can_checkin() 按窗口起点判定（上游是日历日，
+    早于 UTC+8 10:00 轮转点会白跑领取请求），畸形日期 fail-open；
+  - tests/_test_checkin_window.py：本地独有窗口测试套件，51 checks。
+- **脚本策略**：start-qoder-proxy.sh / start-qoder-proxy-lan.sh / stop-qoder-proxy.sh
+  改用上游版（带 --pid-file，stop 脚本读 pid 后校验命令行只停那一个 PID）；
+  allow-firewall.sh 保留本 fork 版（Debian 的 /usr/sbin 不在普通用户 PATH 里，上游版直接
+  command -v 会漏判），并已把上游的 WSL2 双端提示与幂等 -C 检查吸收进来。
+- **安全**：本次合入上游 qoder_webtools.py 的 SSRF 守卫（check_url 只放行 http/https、
+  拒绝 URL 内嵌凭据、字面私网/环回/链路本地/169.254.169.254 全部拒绝、_resolve_public
+  解析后须全为公网、IPv6 只放 2000::/3、_SafeRedirect 逐跳复检、fetch() 强制过 check_url），
+  对应 tests/_test_web_tools.py 24 条。同时上游 v1.4.0 起容器强制 --lan + 强制随机 Key、
+  v1.5.13 一键更新边界（面板会话 + 默认仅本机 + 容器内默认拒绝 + 解压穿越防护）、
+  v1.5.0 面板会话 token 自校验签名，均随合并获得。
+- **运行时数据隔离**：accounts/settings.json 等运行残留已从源码目录清除，accounts/README.txt
+  入库作占位；.gitignore 维持 accounts/* 白名单放行 README.txt。
+
+**验证**：
+
+- `tests/run_all.py`：**73 suites / 73 passed / 0 failed / 2048 checks**（上游 v1.7.1 全量 69/1920
+  + 本 fork 独有 `tests/_test_checkin_window.py` 51 checks + 新增 `tests/_test_issue90_enterprise.py`）。
+- `_test_qoder.py`：**673 checks / 669 passed / 4 skipped / 0 failed**。
+- 点名 PASS：`_test_checkin_window.py` 51、`_test_issue70_schedule.py` 27、
+  `_test_issue85_bat_spaces.py` 7、`_test_issue89_startup_stop.py` 24、`_test_web_tools.py` 24。
+- 端到端（临时账号目录 + 单账号 `smoke.json` + 端口 18892，用上游 `start-qoder-proxy.sh` 启动）：
+  banner 正常、`qoder-proxy.pid` 写入、`/health` 返回 `version: "1.7.2"`；等 22 秒后
+  `accounts/scheduler/state.json` 实证 `checkin_times: "10:00"`、`keepalive_times: "22:00"`、
+  `fired_windows: ["2026-10-24@10:00"]`、`last_claim_window: "2026-10-24@10:00"`、
+  `next_run_time: "2026-10-24 22:00:00"`；`./stop-qoder-proxy.sh 18892` 只停校验过命令行的那一个
+  PID，端口释放、pid 文件自动删除。
+- 合并后 `diff -rq` 对比上游 v1.7.1 只剩预期差异：`allow-firewall.sh`、`CHANGELOG.md`、
+  `qoder_accounts.py`（4470 vs 4436 行）、`qoder_proxy.py`（仅 `VERSION`）、`qoder_scheduler.py`
+  （702 vs 489 行）、`_test_qoder.py`（5095 vs 5092）、`tests/_test_issue70_schedule.py`、
+  本地独有 `tests/_test_checkin_window.py`。
+
 ## v1.6.1
+
+> **fork 说明**：以下 v1.6.10 - v1.7.1 各段为上游 shuishuipingan/qoder2api-hub 原始发布记录，随本次合并不做改动地并入。上游的 v1.6.2 段（#76 自动出口 + #75 身份形态对齐）与上面本 fork 的 v1.6.2（窗口排程断裂修复 + Linux 脚本）同号不同内容：本 fork 的 1.6.2 是基于上游 v1.6.1 的独立补丁线，故上游那一段在此以 v1.6.2 (上游) 标注，避免版本号混淆。
+>
+> 上游的 v1.6.3 - v1.6.9 各段本 fork 未单独发版，内容已随代码合并进来，见下方对应段落。
+
+## v1.7.1
+
+**✨ 数据指标看板重做（统计概览）**
+
+- 顶部「区间胶囊」：今天 / 7 天 / 30 天 / 本月 / 全部 / 自定义（自定义时显示两个日期选择器，带滑块指示器）；
+- 六张 KPI 卡：总请求数、成功请求数、总 Token、活跃天数、当前连续天数、Top 模型；
+- 四张排行面板：Top 账号 / Top 提供商 / 模型用量 / 提供商用量（进度条 + 悬浮明细）；
+- **活跃热力图**：近 365 天按天 Token 着色，5 档图例按本机峰值自适应，月份只在变化处标注；
+- **缓存命中率**：近 10 分钟 / 1 小时 / 24 小时 / 7 天四卡（命中 / 输入）；
+- **近 24 小时双轴趋势**：左轴命中率、右轴总 Token，无请求整点按 0% 计但不写读数；
+- **按天 Token 趋势**：柱状图，空区间给明确占位；
+- 新增后端聚合接口 `GET /usage/stats`（单次扫描 `usage.jsonl` 产出上述全部数据；厂商由模型名推断，账号 UID 自动映射昵称）。
+
+**🧩 页面结构整理**
+
+- **账号独立成页**：账号列表、搜索、区域卡、账号 KPI、签到与福利中心、最近请求全部迁到「账号」页；网关页只保留「网关出口与调度」「运行概览」「模型库」三块；
+- **用量洞察并入数据看板**：导航由 7 项收敛到 6 项，洞察区块作为看板页最后一个分区（标注为全量口径，不随区间变化），随看板一起 30 秒刷新；
+- 账号页新增**搜索**（昵称 / UID / 组织名 / 备注，160ms 防抖，无结果有独立空状态）、吸顶工具栏、行入场动画。
+
+**🎨 产品化视觉层**
+
+- 建立设计令牌（圆角 / 阴影 / 缓动 / 时长 / 字体栈 / 面板渐变）；
+- 卡片统一「描边 + 分层投影 + 极轻渐变」，只有可交互卡片才 hover 抬升；
+- 表格改为小字距大写表头、行分隔线、数字等宽、主题色 4.5% 行 hover；
+- 按钮与表单建立基线（30px 高、8px 圆角、明确 hover/active/focus 态）；
+- 侧栏改为卡片式容器、active 用 2px 主题色左条；细滚动条、`:focus-visible` 光环、深浅色分别调校。
+
+**🐛 问题修复**
+
+- **`range` 形参遮蔽内建 `range()`**：新接口首版 500、连接被直接断开（`TypeError: 'str' object is not callable`）；
+- **面板标题 `<header>` 继承全局吸顶**：滚动时面板标题盖住顶部导航（`header{position:sticky;z-index:10}` 收窄为 `body>header`，并给面板标题显式清吸顶）；
+- **首屏任一 await 抛错就不再切页签**：表现为「页面出来了但数据永远空白」，boot 每步独立容错；
+- **预点亮 TABS 缺 `accounts`/`insights`**：刷新会回落到网关页；
+- **`RECENT_SNAPSHOT` 被误删**：网关页报「账号加载失败」；
+- **面板标题用 `h3` 导致左侧导航整块消失**（`pageNavSections` 只认 `h2`）；顺手让侧栏标签不再带「?」；
+- **侧栏折叠是全局记忆**：任一面折叠后其它页只剩 44px 细条，改为按页面记忆、默认展开。
+
+**验证**：新增 `_test_stats_overview.py`(28)、`_test_accounts_page.py`(22)；更新 `_test_insights_page.py`(25) 与两套旧看板 JS 套件锚点；全量 **72 suites / 1997 checks / 0 failed**。
+
+## v1.7.0
+
+**✨ 企业 / 团队账号（#90）**
+
+企业账号一直能用（额度走组织共享池），但**判定口径是错的**：此前只看 `userType` 含 team/enterprise，或额度里有共享池；而 `/api/v1/userinfo` 根本不返回 `user_type`，于是企业号被当成个人号——团队闸门不生效、共享额度不计入有效余额。
+
+- **判定统一到 `Account.is_team()`，三层优先**：① 组织字段（`organization_id` / `organization_name`，OAuth 登录即有）→ ② `userType` → ③ 额度快照里的共享池（含 `cap=-1` 无限池）；proxy 侧的 `_is_team_account()` 改为委托它，两处口径不再分裂。
+- **面板徽标**：企业/团队账号在账号名旁显示紫色的 **企业 · 组织名**（`public()` 新增 `isTeam` / `orgLabel`），一眼分清个人号与组织席位。
+- **登录字段兼容**：`organization_id` / `organization_name` 同时接受 camelCase 形态，避免换了个上游版本就丢组织信息。
+- **文档**：`docs/accounts.md` 新增《怎么把企业账号接进来》与《「企业号抓不到」的常见原因》——含 SSO 强制场景改用「导入 PAT」、`cap=-1` 无限池的显示口径、以及组织字段为空的含义。
+
+**验证**：新增 `tests/_test_issue90_enterprise.py`（21 条：三层判定、orgLabel 回退、public 字段、面板徽标、camelCase 兼容、文档）；全量 **70 suites / 1941 checks / 0 failed**。
+
+## v1.6.14
+
+**🐛 问题修复（macOS / Linux 常驻场景，#89）**
+
+- **防双开把「正在退出的旧进程」当成健康实例**：启动探测只问「有没有人应答 `/health`」，于是 `kill 旧进程 && 立刻 start` 这种最常见的升级姿势里，旧实例还在收尾、仍能应答，新实例就打印「已有一个反代在运行」并**主动退出**——服务一个都没起来，日志却在说「别重复启动」。
+  现在：`/health` 返回 `pid` / `started_at` / `started_iso`；启动时按**应答者的 pid 是否还活着**分类：
+  - `stale`（pid 已退出）→ 提示「旧实例正在释放端口」并等待重试（最多 3 轮），继续启动；
+  - `healthy` → 仍按双开处理，但提示里带上 **PID / 版本 / 启动时间**，并指向官方停止脚本；
+  - `foreign`（别的服务占端口）→ 保持原有的明确报错。
+  另外 `bind` 失败也加了 3 次重试（每次 1.5s），并在重试期间复查 `/health`——如果确实是健康实例起来了，按「已在运行」退出而不是报错。
+
+- **macOS / Linux 没有官方停止手段**：`start-qoder-proxy.sh` 从不传 `--pid-file`，`qoder-proxy.pid` 永远是陈旧值，常驻（nohup / launchd / tmux）时只能靠 `lsof` 猜 PID。
+  现在：`start-qoder-proxy.sh` 写 `--pid-file`，并新增 **`stop-qoder-proxy.sh`**（对齐 `.bat` 的严谨程度）：
+  - 读 `qoder-proxy.pid` → 校验命令行含 `qoder_proxy.py` → 只停那一个 PID；
+  - 先 `SIGTERM`，10 秒不退再 `SIGKILL`；
+  - pid 文件缺失时按「进程名 + `--port`」兜底，且**拒绝**停不是 qoder-proxy 的进程；
+  - 结束时清理 pid 文件，过期 pid 文件会被识别并移除。
+
+**📚 文档**：README 的平台表、`docs/deployment.md` 的脚本表与升级步骤都补上 macOS / Linux 的停止方式与常驻说明。
+
+**验证**：新增 `tests/_test_issue89_startup_stop.py`（20 条：实例分类四种情况、启动/绑定重试、提示文案、脚本语法与安全校验，POSIX 上还会真跑一次「启动→读 pid→停止→进程消失」）；全量 **69 suites / 1920 checks / 0 failed**。
+
+## v1.6.13
+
+**✨ 新增功能**
+
+- **排队可见 / 快速失败（`QD_QUEUE_WAIT_MODE`）**：`visible`（默认）流式请求先建流并持续发心跳 + `qoder_queue` 提示帧；`fast` 立即返回 503 + `Retry-After`；`wait` 保留旧行为。
+- **排队中文原因**：`上游模型排队中（10605 / RESOURCE_LIMIT）：请稍后重试，或换一个模型/区域。这不是你的 Key、账号或网络问题。`
+- **面板质量指标**：`/health.quality` + 分析页卡片——首字延迟 p50/p90、输出 tok/s、排队率、回读命中。
+
+**🐛 问题修复**
+
+- **Responses（Codex）路径接入回读链**：三条入口（chat / Anthropic / Responses）行为一致。
+- **`/v1/responses` 兼容补齐**：`stream_options` 透传、`parallel_tool_calls` 默认 True；未实现字段显式告警一次。
+- **测试隔离**：runner 统一剥离 `HTTP(S)_PROXY` / `NO_PROXY`（开发机代理会让本机套件被回 502），并修掉 #70 排程套件的时间依赖 flake。
+
+**验证**：68 suites / 1899 checks / 0 failed。
+
+## v1.6.12
+
+**🐛 问题修复**
+
+- **账号测试可能测到别的账号**（#86）：`/accounts/test` 调 `open_upstream()` 时没钉账号，池子会按会话粘性/轮询挑一个——点了 A 号实际测的是 B 号，结果自然对不上。
+  现在 `open_upstream()` 新增 `only_account=` 参数：
+  - 账号测试固定使用被点的那个号（不参与轮换、不走粘性）；
+  - 区域跟随该账号（避免自动路由把请求换到别的区）；
+  - 按「单账号池」处理（冷却压到 3s，不会因为测试失败把整个池子的轮换节奏带偏）；
+  - 成功时清理的是**实际**被测账号的错误状态（`acc.clear_error()`），而不是最初选中的那个。
+  不传该参数时行为与之前逐字节一致（普通请求仍走池）。
+
+**验证**：新增 `tests/_test_issue86_account_test.py`（8 条：源码守卫 + 钉死账号不会被池替换 + 未钉死仍走池）；全量 **67 suites / 1878 checks / 0 failed**。
+
+## v1.6.11
+
+**✨ 新增：账号行显示「今日是否已签到」与「积分变化」**
+
+- **今日签到徽标**：账号名旁直接显示 **✓ 今日已签到**（绿）或 **⏱ 今日未签到**（黄），悬停可看具体日期（`Account.public()` 新增 `checkedInToday` / `lastCheckinDate`）。
+- **积分变化 chip**：积分列在余额后显示最近一次变化——签到 `+100`（绿）/ 消耗 `-35`（红），带弹出动画与时间悬停提示。
+  - 只在数值**真的变化**时更新（`fetch_credits` 对比上一次 `remain_effective`），余额不变不会把旧的 `+100` 冲掉；
+  - 变化值与时间随账号落盘（`lastCreditsDelta` / `lastCreditsDeltaAt`），重启后仍能看到最近一次变化。
+
+**验证**：新增 `tests/_test_account_checkin_status.py`（19 条：今日判定、public 字段、+100/-100/不变三种变化、落盘回读、面板渲染与样式）；全量 **66 suites / 1870 checks / 0 failed**。
+
+## v1.6.10
+
+**🐛 问题修复**
+
+- **启动 bat 无法处理带空格的路径**（#85）：`Start-Process -ArgumentList '%SCRIPT%','--port',...` 的每个元素**不会自动加引号**，路径里有空格时会被拆成多个参数（`C:\Users\My` / `Project\qoder_proxy.py` …），python 直接报找不到文件。
+  现在：
+  - 用 `[char]34` 拼出双引号（避开 bat / PowerShell 双重转义），脚本与 pid 路径都作为**单个带引号参数**传入；
+  - 路径经环境变量（`$env:QD_SCRIPT` 等）传入，避开 `&`、`^` 这类 cmd 元字符；
+  - 日志重定向同样用变量，空格路径不再出错；
+  - `-WindowStyle Hidden` / `-PassThru` / `--pid-file` 语义不变（#50 行为不变）。
+
+  实测：在 `...\my project\qoder proxy\` 这种双层空格目录下启动，桩脚本收到的 argv 为 `['…\qoder proxy\qoder_proxy.py', '--port', '18766', '--pid-file', '…\qoder-proxy.pid']`，参数完整未拆分。
+
+**验证**：新增 `tests/_test_issue85_bat_spaces.py`（9 条：源码守卫 + ASCII-only + 真实带空格目录端到端）；全量 **65 suites / 1851 checks / 0 failed**。
+
 
 **🐛 问题修复**
 

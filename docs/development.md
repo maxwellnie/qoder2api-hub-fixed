@@ -48,7 +48,7 @@ CI（`.github/workflows/tests.yml`）在 Ubuntu Python 3.9、Ubuntu Python 3.12�
 |---|---|
 | `python _refresh_catalog.py` | 官方客户端更新后，从本机客户端的模型目录缓存重新导出两个区域的快照，并打印价格、上下文、思考档位的变化。加 `--dry-run` 只看差异，不写文件 |
 | `python _verify_models.py --base http://127.0.0.1:8790` | 网关运行时，逐个对比模型清单和官方数据 |
-| `python _install_umid.py` | 从官方 npm 包 `@qoder-ai/qodercli` 中提取当前平台的 UMID 组件，写到 `umid/runtime-info`。可用 `--platform` / `--arch` / `--dest` 指定 |
+| `python _install_umid.py` | 从官方 npm 包 `@qoder-ai/qodercli` 中提取当前平台的 UMID 组件，写到 `umid/runtime-info`（Windows 为 `runtime-info.exe` + `sgsdk.dll`）。可用 `--platform` / `--arch` / `--dest` 指定 |
 | `python _diag_gateway.py` / `python _diag_campaign.py` | 诊断脚本，见[故障排查](troubleshooting.md#诊断脚本) |
 
 ## 发版

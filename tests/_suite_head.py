@@ -38,10 +38,18 @@ __all__ = ["base64", "contextlib", "hashlib", "io", "json", "os", "re", "shutil"
 
 
 def bootstrap(env=None):
-    """把 ROOT 放进 sys.path、设好 ACCOUNTS_DIR，导入 P / A 并返回。"""
+    """把 ROOT 放进 sys.path、设好 ACCOUNTS_DIR，导入 P / A 并返回。
+
+    USAGE_DIR 必须跟 ACCOUNTS_DIR 一起隔离：套件起真实 HTTP server 发请求时，
+    _persist_usage() 会把每行用量写进 USAGE_LOG。只改 ACCOUNTS_DIR 不改这里，
+    测试流量就落进线上 usage/usage.jsonl —— 看板上多出一堆「账号=-、
+    Key=历史行未记录」的失败行。
+    """
     if ROOT not in sys.path:
         sys.path.insert(0, ROOT)
     os.environ.setdefault("ACCOUNTS_DIR", os.path.join(ROOT, "_acc"))
+    os.environ.setdefault("QD_PROXY_USAGE_DIR",
+                          os.path.join(ROOT, "_acc", "usage"))
     for k, v in (env or {}).items():
         os.environ.setdefault(k, str(v))
     import qoder_accounts as A

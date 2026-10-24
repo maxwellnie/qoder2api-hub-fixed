@@ -111,7 +111,8 @@ def identity_report(realm, account_id):
     # 对应的补装命令，否则用户会照着 Windows 的说法去找一个不存在的文件。
     exe = A.runtime_info_exe(realm)
     if os.name == "nt":
-        comp, fix = "runtime-info.exe", "（桌面客户端自带）"
+        comp, fix = ("runtime-info.exe",
+                     "（桌面客户端自带，或跑 python _install_umid.py 提取）")
     else:
         comp, fix = "runtime-info", "（先跑 python _install_umid.py 提取）"
     if not exe:

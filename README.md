@@ -39,7 +39,7 @@ cd qoder2api-hub
 | 平台 | 启动 | 停止 |
 |---|---|---|
 | Windows | 双击 `start-qoder-proxy.bat`（后台运行，日志写入 `qoder-proxy.log`） | `stop-qoder-proxy.bat` |
-| Linux / macOS | `chmod +x *.sh && ./start-qoder-proxy.sh`（前台运行） | `Ctrl+C` |
+| Linux / macOS | `chmod +x *.sh && ./start-qoder-proxy.sh`（前台运行；会写 `qoder-proxy.pid`） | `Ctrl+C`，常驻时用 `./stop-qoder-proxy.sh` |
 | Docker | `docker compose up -d` | `docker compose down` |
 
 启动后：

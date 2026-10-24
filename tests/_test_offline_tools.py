@@ -136,6 +136,43 @@ check("identify_blob：WASM 正确；非原生数据一律 unknown（空/垃圾/
       and U30.identify_blob(_elf30(0x28)) == "unknown"
       and U30.identify_blob(_elf30(0x3E, endian=2)) == "unknown",
       (U30.identify_blob(_WASM30), U30.identify_blob(b""), U30.identify_blob(_elf30(0x3E, endian=2))))
+def _pe30_chars(machine, chars, size=0x80):
+    buf = bytearray(max(size, 0x80))
+    buf[0:2] = b"MZ"
+    buf[0x3C:0x40] = _st_30.pack("<I", 0x40)
+    buf[0x40:0x44] = b"PE\x00\x00"
+    buf[0x44:0x46] = _st_30.pack("<H", machine)
+    buf[0x40 + 22:0x40 + 24] = _st_30.pack("<H", chars)
+    return bytes(buf)
+
+
+_pe_exe30 = _pe30_chars(0x8664, 0x0002, size=500 * 1024)
+_pe_big_exe30 = _pe30_chars(0x8664, 0x0002, size=3 * 1024 * 1024)
+_pe_dll30 = _pe30_chars(0x8664, 0x2002, size=3 * 1024 * 1024)
+check("is_pe_dll + select_win32_pair：按 PE IMAGE_FILE_DLL (0x2000) 标志位区分 EXE 与 DLL",
+      U30.is_pe_dll(_pe_exe30) is False
+      and U30.is_pe_dll(_pe_big_exe30) is False
+      and U30.is_pe_dll(_pe_dll30) is True
+      and U30.select_win32_pair([(0, 1, _pe_exe30), (1, 2, _pe_big_exe30)]) is None
+      and U30.select_win32_pair([(0, 1, _pe_exe30), (1, 2, _pe_big_exe30), (2, 3, _pe_dll30)])
+      == ((0, _pe_exe30), (2, _pe_dll30)))
+_tmp30w = _tf_30.mkdtemp(prefix="qd-umid-win-")
+try:
+    _exe30w = os.path.join(_tmp30w, "runtime-info.exe")
+    _dll30w = os.path.join(_tmp30w, "sgsdk.dll")
+    _missing30w = U30.win32_pair_installed(_exe30w, _dll30w)
+    for _p30w, _d30w in ((_exe30w, _pe_exe30), (_dll30w, _pe_exe30)):
+        with open(_p30w, "wb") as _fh30w:
+            _fh30w.write(_d30w)
+    _swapped30w = U30.win32_pair_installed(_exe30w, _dll30w)
+    with open(_dll30w, "wb") as _fh30w:
+        _fh30w.write(_pe_dll30)
+    _ok30w = U30.win32_pair_installed(_exe30w, _dll30w)
+finally:
+    _sh_30.rmtree(_tmp30w, ignore_errors=True)
+check("win32_pair_installed：缺文件 / dll 不带 DLL 标志位 → False；exe+dll 正确 → True",
+      _missing30w is False and _swapped30w is False and _ok30w is True,
+      (_missing30w, _swapped30w, _ok30w))
 
 # --- 30.2 平台 / 架构选择 ---
 check("component_for_platform：linux/darwin × x86_64/arm64 映射正确（含 AMD64/aarch64 别名）",

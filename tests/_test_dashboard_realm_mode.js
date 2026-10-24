@@ -19,7 +19,7 @@ function slice(from, to){
   return (a >= 0 && b > a) ? html.slice(a, b) : '';
 }
 const FN = slice('function realmModeOf(state){', 'function updateUI(){');
-const CONSTS = slice('const BYKEY_RANGE = ', 'async function loadByKey(){');   // 提供 RECENT_SNAPSHOT 的声明
+const CONSTS = slice('let RECENT_SNAPSHOT = null;', 'function statDayStr(d){');   // 提供 RECENT_SNAPSHOT 的声明
 check('锚点：realmModeOf / realmActualNote / 渲染与切换函数都抽到（含 RECENT_SNAPSHOT 常量区）', FN.length > 1800 && CONSTS.length > 60);
 // 片段依赖自检：eval 范围必须自带它引用的声明。少了这条，缺声明会以「ReferenceError 崩掉、没有 SUMMARY」的形式出现，
 // 还会被误读成「dashboard.html 坏了」——实际上浏览器加载整块脚本时声明就在，只有按片段 eval 的套件才需要它。

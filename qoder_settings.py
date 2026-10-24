@@ -269,6 +269,22 @@ def set_auth_disabled(accounts_dir, disabled):
         save(accounts_dir, data)
 
 
+def web_tools_enabled(accounts_dir):
+    """本地 web 工具开关（面板「设置 → 本地 web 工具」）。
+
+    默认关闭：这是唯一会**由模型驱动出网**的能力，必须显式开启。
+    环境变量 QD_WEB_TOOLS 优先于这里的持久化开关。
+    """
+    return load(accounts_dir).get("web_tools") is True
+
+
+def set_web_tools_enabled(accounts_dir, enabled):
+    with _lock:
+        data = load(accounts_dir)
+        data["web_tools"] = bool(enabled)
+        save(accounts_dir, data)
+
+
 # ------------------------------------------------------------- model gates
 # P1-4：模型闸门配置层。全局封禁（banned_models）与每 Key 白名单（key 条目的
 # models 字段）共用同一套 pattern 清洗与匹配：fnmatch 通配、大小写不敏感；

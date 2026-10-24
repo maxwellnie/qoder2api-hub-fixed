@@ -341,6 +341,43 @@ try:
     check("#48-20 补投·平票(2/2/1) → 组件被调 **5** 次、无多数时取**首个**样本（A）",
           len(_c20) == 5 and _i20.get("machineToken") == "tok-a"
           and (_i20.get("vm_info") or {}).get("brand") == "KVM", (len(_c20), _i20))
+    # ---- 21 environment 缓存校验：旧缓存无 environment 或不匹配时丢弃重取 ----
+    _idc_env()
+    _c21a = []
+    A.run_runtime_info = _idc_stub(_c21a)
+    A.native_machine_identity("cn", "v21")
+    _f21 = _idc_read()
+    check("#48-21a 落盘缓存记录 environment（cn='0'，intl='3'）",
+          ((_f21.get("realm") or {}).get("cn") or {}).get("environment") == "0"
+          and A._runtime_info_env("cn") == "0"
+          and A._runtime_info_env("intl") == "3",
+          _f21)
+    _f21["realm"]["cn"]["environment"] = "prod"
+    with open(_IDC_FILE, "w", encoding="utf-8") as _fh:
+        json.dump(_f21, _fh, ensure_ascii=False)
+    A._native_ident_cache.clear()
+    _c21b = []
+    A.run_runtime_info = _idc_stub(_c21b)
+    A.native_machine_identity("cn", "v21b")
+    check("#48-21b 旧缓存 environment='prod' 不匹配 → 丢弃旧缓存并重新调组件写入新 environment",
+          len(_c21b) == 3
+          and ((_idc_read().get("realm") or {}).get("cn") or {}).get("environment") == "0",
+          (len(_c21b), _idc_read()))
+    # 组件失败时回退旧环境缓存：内存缓存期内必须直接命中，不能每次都重新拉起组件
+    _f21c = _idc_read()
+    _f21c["realm"]["cn"]["environment"] = "prod"
+    with open(_IDC_FILE, "w", encoding="utf-8") as _fh:
+        json.dump(_f21c, _fh, ensure_ascii=False)
+    A._native_ident_cache.clear()
+    _c21c = []
+    A.run_runtime_info = _idc_stub(_c21c, fail=True)
+    _i21c1 = A.native_machine_identity("cn", "v21c")
+    _n21c = len(_c21c)
+    _i21c2 = A.native_machine_identity("cn", "v21c")
+    check("#48-21c 组件失败回退旧环境缓存 → 内存缓存期内不再重复调组件",
+          _i21c1.get("machineToken") == "tok-1" and _i21c2 == _i21c1
+          and _n21c >= 1 and len(_c21c) == _n21c,
+          (_n21c, len(_c21c), _i21c1))
 finally:
     A.run_runtime_info = _IDC_ORIG_RUN
     A._native_ident_cache.clear()

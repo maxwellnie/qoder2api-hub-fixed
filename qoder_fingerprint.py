@@ -214,11 +214,13 @@ def vm_status(bridge_vm_info=None, bridge_available=None):
     """本机虚拟化状态（中文输出），供看板 / 体检脚本共用。
 
     bridge_vm_info：官方风控桥 runtime-info.exe 返回的 vmInfo（最权威）
-    bridge_available：官方风控桥是否可用（None=未知）
+    bridge_available：官方风控桥是否可用（None=未知）。它不改变 source（source
+                      只看 vmInfo 里有没有 isVm），只用于把 summary 里的降级
+                      原因说对：桥不可用 vs 桥可用但没给 vmInfo。
 
     返回：
       {is_vm, level(高/中/低/无/未知), score, brand, brand_cn,
-       vm_type_code, source(runtime-info/local/none), evidence[], summary}
+       vm_type_code, source(runtime-info/local), evidence[], summary}
     """
     evidence, hint = _local_vm_evidence()
     info = bridge_vm_info if isinstance(bridge_vm_info, dict) else {}
@@ -226,10 +228,14 @@ def vm_status(bridge_vm_info=None, bridge_available=None):
     score = info.get("percentage")
     brand = str(info.get("brand") or "") or hint
     if is_vm is None:
-        # 桥不可用/无结果：退化为本机交叉校验结论
+        # 桥不可用/无 isVm 字段：结论全部来自本机交叉校验，来源只能是 local。
+        # 曾经的判据 `evidence or bridge_available is None` 在「桥不可用 +
+        # 物理机」下双双为假，把本机交叉校验谎报成 runtime-info —— 看板因此
+        # 少一句「官方风控桥不可用」的降级说明（dashboard 只在 source==local
+        # 时显示它），用户看到一个没有证据支撑的来源。
         is_vm = bool(hint) or any("虚拟化驱动" in e or "hypervisor" in e
                                  for e in evidence)
-        source = "local" if (evidence or bridge_available is None) else "runtime-info"
+        source = "local"
     else:
         source = "runtime-info"
     if info:
@@ -245,7 +251,16 @@ def vm_status(bridge_vm_info=None, bridge_available=None):
     else:
         summary = "未检测到虚拟化运行环境（物理机）"
     if source == "local":
-        summary += "；官方风控桥不可用，以上为本机交叉校验结果"
+        # “本机交叉校验”这个来源不变，但**原因**必须说对：桥不可用 vs
+        # 桥能用却没给出 vmInfo，是两回事。写成一句“桥不可用”会在后者
+        # 场景下与同一响应里的 bridge_available=true 自相矛盾（看板据此显示
+        # 的降级说明也是假的）。
+        if bridge_available is False:
+            summary += "；官方风控桥不可用，以上为本机交叉校验结果"
+        elif bridge_available:
+            summary += "；官方风控桥未返回虚拟机信息，以上为本机交叉校验结果"
+        else:
+            summary += "；以上为本机交叉校验结果"
     return {
         "is_vm": bool(is_vm),
         "level": _vm_level_cn(score) if is_vm else "无",

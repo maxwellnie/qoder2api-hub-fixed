@@ -65,7 +65,17 @@ goto end
 
 :launch
 echo Starting qoder-proxy on port %PORT% (detached) ...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = Start-Process -FilePath '%PYEXE%' -ArgumentList '%SCRIPT%','--port','%PORT%','--pid-file','%PIDFILE%' -WindowStyle Hidden -RedirectStandardOutput '%LOGFILE%' -RedirectStandardError '%ERRFILE%' -PassThru; Start-Sleep -Milliseconds 1500; if ($p.HasExited) { Write-Host '[WARN] exited early - see qoder-proxy.log' } else { Write-Host ('[OK] started, PID ' + $p.Id) }"
+rem issue #85: -ArgumentList elements are NOT auto-quoted, so a path with
+rem spaces gets split into several argv entries. Build the quotes with
+rem [char]34 (avoids bat/powershell double-escaping) and pass paths via
+rem environment variables (avoids cmd metacharacters like & and ^).
+set "QD_EXE=%PYEXE%"
+set "QD_SCRIPT=%SCRIPT%"
+set "QD_PIDFILE=%PIDFILE%"
+set "QD_LOGFILE=%LOGFILE%"
+set "QD_ERRFILE=%ERRFILE%"
+set "QD_PORT=%PORT%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$q = [char]34; $args = @(($q + $env:QD_SCRIPT + $q), '--port', $env:QD_PORT, '--pid-file', ($q + $env:QD_PIDFILE + $q)); $p = Start-Process -FilePath $env:QD_EXE -ArgumentList $args -WindowStyle Hidden -RedirectStandardOutput $env:QD_LOGFILE -RedirectStandardError $env:QD_ERRFILE -PassThru; Start-Sleep -Milliseconds 1500; if ($p.HasExited) { Write-Host '[WARN] exited early - see qoder-proxy.log' } else { Write-Host ('[OK] started, PID ' + $p.Id) }"
 echo.
 echo   API      : http://127.0.0.1:%PORT%/v1
 echo   Dashboard: http://127.0.0.1:%PORT%/

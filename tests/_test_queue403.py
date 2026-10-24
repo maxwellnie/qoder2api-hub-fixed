@@ -99,11 +99,14 @@ _before_enabled = _acc.enabled
 _before_cool = getattr(_acc, "error_until", 0)
 _before_le = getattr(_acc, "last_error", "")
 _err, _resp = _run(_pool1, _raise(403, QUEUE_BODY))
-check("队列 403 最终抛 RateLimited（而不是把 403 丢给客户端）",
-      isinstance(_err, P.RateLimited), type(_err).__name__ if _err else None)
-check("RateLimited 的 Retry-After 用上游的 retryAfterSeconds",
-      isinstance(_err, P.RateLimited) and _err.wait == 30,
-      getattr(_err, "wait", None))
+# issue #87：排队改为 UpstreamQueued（503 + Retry-After + 中文原因），
+# 不再伪装成 429 RateLimited——客户端应当「稍后重试」而不是「被限流」。
+check("队列 403 最终抛 UpstreamQueued（而不是把 403 丢给客户端）",
+      isinstance(_err, P.UpstreamQueued), type(_err).__name__ if _err else None)
+check("UpstreamQueued 携带 retryAfterSeconds=30 与 503",
+      isinstance(_err, P.UpstreamQueued) and _err.retry_after == 30
+      and _err.status == 503,
+      (getattr(_err, "retry_after", None), getattr(_err, "status", None)))
 check("队列 403 不禁用账号", _acc.enabled is True and _before_enabled is True)
 check("队列 403 不写 account.last_error（面板不会显示「凭证无效」）",
       getattr(_acc, "last_error", "") == _before_le,

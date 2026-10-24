@@ -75,7 +75,7 @@
 
 国际版的活动接口会严格校验 `Cosy-MachineToken` / `MachineCode` / `MachineType`。这套身份必须由官方 UMID 组件生成，派生出来的假身份会导致活动被整条过滤掉。所以拿不到真实身份时，网关不会发送这组请求头，并在活动状态里标注 `machine_headers=omitted`。
 
-- **Windows**：使用桌面客户端自带的组件，安装官方桌面客户端即可
+- **Windows**：使用桌面客户端自带的组件，安装官方桌面客户端即可；不想装客户端时，也可以运行 `python _install_umid.py` 提取 `runtime-info.exe` + `sgsdk.dll`
 - **Linux / macOS**：运行 `python _install_umid.py`，从官方 npm 包中提取组件（会校验 sha512，不需要 node）
 - **Docker**：镜像构建时已经提取好
 

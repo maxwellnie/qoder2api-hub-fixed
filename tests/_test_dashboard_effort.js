@@ -19,9 +19,9 @@ function slice(from, to){
   return (a >= 0 && b > a) ? html.slice(a, b) : '';
 }
 const KEY_PART = slice('const KEY_ID_LABELS = {', 'async function refreshInner(){');
-const BYKEY_CONSTS = slice('const BYKEY_RANGE = ', 'async function loadByKey(){');
+const BYKEY_CONSTS = slice('let RECENT_SNAPSHOT = null;', 'function statDayStr(d){');
 const STATS = slice('function effortStatsByKey(rows){', 'function renderEffortByKey(){');
-const RENDER = slice('function renderEffortByKey(){', 'async function loadAnalytics(){');
+const RENDER = slice('function renderEffortByKey(){', 'function statInit(){');
 check('锚点：Key/档位列区、by-key 常量区、汇总函数、趋势面板渲染区都抽到',
   KEY_PART.length > 400 && BYKEY_CONSTS.length > 60 && STATS.length > 200 && RENDER.length > 400);
 check('纯函数区（effortStatsByKey）不引用 document/window', !/document\.|window\./.test(STATS));

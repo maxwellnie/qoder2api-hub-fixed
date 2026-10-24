@@ -32,8 +32,104 @@ _h2 = _hdr("uid-b")
 check("#64 不同账号主机名不同（避免多号关联）",
       _h1["cosy-machinehostname"] != _h2["cosy-machinehostname"],
       (_h1["cosy-machinehostname"], _h2["cosy-machinehostname"]))
-check("#64 非 sse 请求不带 infer-sse 专属头",
-      "cosy-machinehostname" not in _hdr("uid-a", sse=False))
+_h_nosse = _hdr("uid-a", sse=False)
+check("#64 非 sse 请求同样带 cosy-machineos，但不带 infer-sse 专属 cosy-machinehostname",
+      "cosy-machineos" in _h_nosse and "cosy-machinehostname" not in _h_nosse,
+      _h_nosse)
+check("#64 活动链路与推理链路报的 cosy-machineos 一致",
+      A.MACHINE_OS == S.COSY_MACHINE_OS and _h1.get("cosy-machineos") == A.MACHINE_OS,
+      (A.MACHINE_OS, S.COSY_MACHINE_OS))
+_proxy_src = open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
+check("#64 CLI 1.1.75 推理头含 business-product/type/scene、clientip，UA 为 undici 默认值且 proxy 不覆盖",
+      _h1.get("cosy-business-product") == "cli"
+      and _h1.get("cosy-business-type") == "agent"
+      and _h1.get("cosy-scene") == "assistant"
+      and _h1.get("cosy-data-policy") == "agree"
+      and _h1.get("cosy-clientip") == "169.254.198.161"
+      and _h_nosse.get("cosy-clientip") == "169.254.198.161"
+      and _h1.get("user-agent") == "undici"
+      and _h_nosse.get("user-agent") == "undici"
+      and 'headers["User-Agent"] =' not in _proxy_src
+      and 'headers["user-agent"] =' not in _proxy_src,
+      _h1)
+
+# ---- runtime-info 调用契约（对齐官方 CLI 1.1.75，打桩 subprocess 全程离线）
+import subprocess as _sp             # noqa: E402
+_rt_calls = []
+
+
+def _rt_fake_run(cmd, input=None, **kw):
+    _rt_calls.append((list(cmd), input))
+    return _sp.CompletedProcess(cmd, 0, b'{"machineToken":"t"}\n', b"")
+
+
+_rt_orig = (A.runtime_info_exe, _sp.run, sys.platform)
+A.runtime_info_exe = lambda realm: "/opt/umid/runtime-info"
+_sp.run = _rt_fake_run
+try:
+    sys.platform = "linux"
+    A.run_runtime_info("cn", "uid-x")
+    sys.platform = "darwin"
+    A.run_runtime_info("intl", "uid-x")
+    A.run_runtime_info("intl", "")
+finally:
+    A.runtime_info_exe, _sp.run, sys.platform = _rt_orig
+check("runtime-info：linux 只传环境码、stdin 直接 EOF（cn=0）",
+      _rt_calls[0] == (["/opt/umid/runtime-info", "0"], b""), _rt_calls[:1])
+check("runtime-info：darwin 有 account 时带 --account-stdin，stdin 以换行结尾（intl=3，同官方桌面端）",
+      _rt_calls[1] == (["/opt/umid/runtime-info", "3", "--account-stdin"],
+                       b'{"account":"uid-x"}\n'), _rt_calls[1:2])
+check("runtime-info：darwin 无 account 时不带 --account-stdin",
+      _rt_calls[2] == (["/opt/umid/runtime-info", "3"], b""), _rt_calls[2:3])
+
+# ---- 活动列表请求头：与官方桌面端 0.4.8 主进程的头集合逐键一致
+_DESK_BASE = {"Accept", "User-Agent", "Authorization", "cosy-clienttype", "cosy-version"}
+_DESK_MACHINE = {"cosy-machineid", "cosy-machinetoken", "cosy-machinetype",
+                 "cosy-machinecode", "cosy-machineos", "cosy-machinehostname"}
+_dh_orig = A.native_machine_identity
+try:
+    A.native_machine_identity = lambda realm, account_id, force=False: {
+        "machineToken": "nt", "machineType": "3", "machineCode": "nc",
+        "source": A.MACHINE_IDENTITY_NATIVE}
+    _dh_acc = A.Account({"uid": "desk-u", "realm": "intl", "accessToken": "tok"})
+    _dh_native = _dh_acc.desktop_headers()
+    A.native_machine_identity = lambda realm, account_id, force=False: {}
+    _dh_derived = _dh_acc.desktop_headers()
+finally:
+    A.native_machine_identity = _dh_orig
+check("桌面端列表头（原生身份）= 官方集合，无 Content-Type / X-Request-ID / Origin 等多余头",
+      set(_dh_native) == _DESK_BASE | _DESK_MACHINE
+      and _dh_native["Accept"] == "application/json"
+      and _dh_native["User-Agent"] == "Qoder"
+      and _dh_native["Authorization"] == "Bearer tok"
+      and _dh_native["cosy-machinehostname"] == A.MACHINE_HOSTNAME,
+      _dh_native)
+check("桌面端列表头（derived）只发基础五头（issue #10：不发任何 cosy-machine*）",
+      set(_dh_derived) == _DESK_BASE, sorted(_dh_derived))
+check("主机名取本机 hostname 并按官方规则规整",
+      A.MACHINE_HOSTNAME == A._header_safe_hostname(__import__("socket").gethostname()),
+      A.MACHINE_HOSTNAME)
+_long_host = "h" * 120
+check("主机名规整：可打印 ASCII 原样 / 空串不发 / 超长截断加哈希 / 非法字符折叠加哈希",
+      A._header_safe_hostname(" my-pc ") == "my-pc"
+      and A._header_safe_hostname("  ") == ""
+      and A._header_safe_hostname(_long_host)
+      == "h" * 87 + "-" + A._hostname_hash(_long_host)
+      and A._header_safe_hostname("my\tpc") == "my-pc-" + A._hostname_hash("my\tpc"),
+      (A._header_safe_hostname(_long_host), A._header_safe_hostname("my\tpc")))
+
+_claim_hdrs = []
+_claim_orig = (A.http_json, A.Account.desktop_headers)
+A.http_json = lambda url, **kw: (_claim_hdrs.append(kw.get("headers")) or {"status": "CLAIMED"})
+A.Account.desktop_headers = lambda self: {"Accept": "application/json"}
+try:
+    A.Account({"uid": "claim-u", "realm": "cn", "accessToken": "t"}).claim_campaign("c1")
+finally:
+    A.http_json, A.Account.desktop_headers = _claim_orig
+check("claim 带请求体：在桌面端头之上补 Content-Type: application/json",
+      _claim_hdrs and _claim_hdrs[0] == {"Accept": "application/json",
+                                         "Content-Type": "application/json"},
+      _claim_hdrs)
 
 os.environ["QD_COSY_OS_HEADERS"] = "0"
 try:

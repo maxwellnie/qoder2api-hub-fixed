@@ -105,3 +105,30 @@
 | GET | `/agents/models` | 面板 | 用于预填客户端配置的模型表 |
 | GET | `/agents/cli` | 公开 | 配置器 CLI 的源码，供远程机器下载 |
 | POST | `/agents/apply`、`/agents/restore` | 面板，且只接受本机访问 | 写入客户端配置 / 还原到接入前 |
+
+
+## 用量洞察（参考 wb 的三项能力）
+
+| 端点 | 说明 | 数据来源 |
+|---|---|---|
+| `GET /pricing` | 参考价目表（USD / 1M tokens）+ 未定价模型清单 | `qoder_pricing.DEFAULT_PRICES` + `usage/pricing-overrides.json` |
+| `GET /accounts/credits/grants` | 积分包 / 获取记录（面额、剩余、已用） | 最近一次积分快照（**不发上游请求**） |
+| `GET /usage/remaining` | 每账号剩余积分 + 近 24h 消耗 + 预计可用天数 | `usage.jsonl` + 账号积分 |
+| `GET /accounts/activity` | 签到 / 领取动作流水（30 天保留） | `usage/activity.jsonl` |
+
+### 费用估算口径
+
+- 输入按「缓存命中 / 未命中」两档、输出单独一档，单位 USD / 1M tokens；
+- 只用于「这些 token 放在 OpenRouter 上大概值多少钱」的参考，**不能用于结算**；
+- 未收录模型**不计价**（面板显示 `—`，绝不猜数字），可在 `usage/pricing-overrides.json` 覆盖：
+
+```json
+{"dfmodel": {"in": 0.28, "cached": 0.028, "out": 0.42},
+ "my-custom-model": [0.5, 0.1, 2.0]}
+```
+
+### 动作流水
+
+`POST /accounts/checkin` 与「领取全部福利」会往 `usage/activity.jsonl` 追加一行（时间 / 动作 / 账号 / 结果 / 积分 / 说明），
+文件超过 5MB 自动轮转为 `.1`，读接口只返回最近 30 天。
+
