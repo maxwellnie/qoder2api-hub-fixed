@@ -3,10 +3,11 @@
 
 用途（客户端更新后跑一次即可跟上官方）：
   1. 解密本机官方客户端的模型目录缓存
-       国际版  ~/.qoder/.models/<uid>/catalog-v6
-       国内版  ~/.qoder-cn/.models/<uid>/catalog-v6
-     （QMC v1：HKDF-SHA256(uid) + AES-256-GCM，见 qoder_sign.qmc_decrypt）
-  2. 取 chat 场景条目**逐字段原样**写入
+       国际版  ~/.qoder/.models/<uid>/catalog-v7（1.1.81+，v6 兜底）
+       国内版  ~/.qoder-cn/.models/<uid>/catalog-v7（同上）
+     （QMC v1：HKDF-SHA256(uid) + AES-256-GCM，见 qoder_sign.qmc_decrypt；
+       v7 与 v6 同为 QMC v1 加密，只是场景更全——chat 条目字段一致）
+  2. 取 chat + app-only 对话条目**逐字段原样**写入
        qoder_catalog_intl.json / qoder_catalog_cn.json
      （网关运行时优先读这两个文件；`qoder_catalog.py` 里的内嵌副本只是
        文件缺失时的冻结回退，默认一并更新，见 --inline/--no-inline）
@@ -30,6 +31,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from qoder_sign import qmc_decrypt  # noqa: E402
+from qoder_catalog import dialogue_models  # noqa: E402
 
 REALMS = (
     ("intl", ".qoder", "qoder_catalog_intl.json", "_INTL_JSON"),
@@ -43,7 +45,7 @@ COMPARE_FIELDS = ("enable", "price_factor", "max_input_tokens", "is_free",
 
 
 def client_catalog_path(home_dir):
-    """返回本机客户端目录缓存文件路径（catalog-v6）。"""
+    """返回本机客户端目录缓存文件路径（catalog-v7 优先，老客户端 v6 兜底）。"""
     home = os.path.join(os.path.expanduser("~"), home_dir, ".models")
     if not os.path.isdir(home):
         return ""
@@ -58,20 +60,20 @@ def client_catalog_path(home_dir):
     subs = [uid] if uid and os.path.isdir(os.path.join(home, uid)) else \
         sorted(d for d in os.listdir(home) if os.path.isdir(os.path.join(home, d)))
     for sub in subs:
-        cat = os.path.join(home, sub, "catalog-v6")
-        if os.path.isfile(cat):
-            return cat
+        for fname in ("catalog-v7", "catalog-v6"):
+            cat = os.path.join(home, sub, fname)
+            if os.path.isfile(cat):
+                return cat
     return ""
 
 
 def read_chat_models(cat_path):
-    """解密 catalog-v6 并取 chat 场景条目（逐字段原样）。"""
+    """解密 catalog-v6 并取 chat + app-only 对话条目（逐字段原样）。"""
     sub = os.path.basename(os.path.dirname(cat_path))
     with io.open(cat_path, "rb") as fh:
         blob = fh.read().decode("ascii", "replace")
     plain = json.loads(qmc_decrypt(blob, sub).decode("utf-8"))
-    return [m for m in (plain.get("chat") or [])
-            if isinstance(m, dict) and m.get("key")]
+    return dialogue_models(plain)
 
 
 def summarize(old, new):

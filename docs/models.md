@@ -14,12 +14,16 @@
 
 1. **官方动态接口** `/algo/api/v2/model/list`：需要账号，返回官方当前的清单。每次获取成功都会写入磁盘缓存
 2. **磁盘缓存** `accounts/models-cache-<区域>.json`：上次从动态接口获取成功的结果，7 天内有效。容器重启或上游暂时不可用时先用它，不必退回到可能已经过时的内置快照
-3. **本机官方客户端的模型目录缓存** `~/.qoder*/.models/<uid>/catalog-v6`：离线也能用
+3. **本机官方客户端的模型目录缓存** `~/.qoder*/.models/<uid>/catalog-v7`（官方 1.1.81+ 写 v7，老客户端的 catalog-v6 兜底）：离线也能用
 4. **仓库内置的快照** `qoder_catalog_cn.json` / `qoder_catalog_intl.json`：可以用 `python _refresh_catalog.py` 从本机客户端更新
+
+官方改**显示名**（如 kmodel_latest 从 Kimi-K3 改为 Kimi-K3.1-Pro）而快照还没跟上时，动态清单里的新名字也能被解析成上游 key——动态清单一到手就会把「显示名 -> key」注册进解析器；改名窗口期内请求路径会用离线源兜底补注册（不出网、不碰账号池）。
 
 清单在内存中缓存 5 分钟。想立即重新获取，调用 `GET /models/refresh`（需要 API Key）。
 
 - 清单以动态接口返回的为准，国内版和国际版各不相同
+- 对话目录取 `chat` 并补充 `app` 中独有的条目；同 key 以 `chat` 的价格、权限和元数据为准。不合并 inline/补全、quest 或 BYOK 私有场景。QoDuck 当前仅在 `app` 场景出现，上游 key 为 `lmodel`，双区均有；在线、本机缓存、离线快照和名称解析已统一。
+- QoDuck 的 `0x` / Free 是当前官方返回的活动状态，不代表永久免费或无排队；最小实测国内返回 OK，国际可能返回10605资源排队，按官方资源状态处理。
 - 官方标记为不可用（`enable=false`）的模型也会列出来，并附上官方给出的原因（`disabled_reason`）
 - 官方没有提供的字段（例如最大输出长度）不会填写，网关不编造数据
 - 当前使用的是哪个快照，可以通过 `/v1/models` 的 `catalog_source` 字段查看

@@ -76,6 +76,9 @@ class Scheduler(object):
         st = self._load_state()
         self.enabled = bool(st.get("enabled", True))   # 看板开关重启后仍生效
         self._apply_schedule(st)                        # issue #70：排程配置持久化
+        # issue #130：_apply_schedule 不再清空 _fired，但恢复仍放在其后——
+        # 保证「排程配置」与「已触发点」都就位后再算下一次触发。
+        self._fired_import(st.get("fired"))
         self.last_run_time = st.get("last_run_time") or None
         self.next_run_time = None
         self.logs = [str(x) for x in (st.get("logs") or [])][-60:]
@@ -242,15 +245,8 @@ class Scheduler(object):
             self.jitter_secs = max(0, min(60, int(st.get("jitter_secs") or 8)))
         except Exception:
             self.jitter_secs = 8
-        # 只清上游排程点键（epoch），保留我方窗口键
-        # （YYYY-MM-DD@HH:00）：否则面板改一次排程就把本轮窗口已补领过的
-        # 记忆抹掉，进程重启后会把同一轮窗口重放一遍
-        # （_mark_fired 的落盘兜底随之失效）。
-        _win_keys = [k for k in self._fired
-                     if isinstance(k, str) and '@' in k]
-        self._fired = {}
-        for _k in _win_keys:
-            self._fired[_k] = 0.0
+        # issue #130：**不要**清空 _fired —— 改排程/热重载时清空会让 3 小时
+        # 内的排程点再触发一次（重复签到）。新排程点有新的 ts，天然不会被误挡。
         self._calc_next_fire()
 
     def set_schedule(self, checkin_times=None, keepalive_times=None,
@@ -272,6 +268,38 @@ class Scheduler(object):
     # -- 状态持久化 ---------------------------------------------------------
     def _state_path(self):
         return os.path.join(self.state_dir, STATE_SUBDIR, STATE_FILE_NAME)
+
+    # ---- issue #130：已触发排程点的持久化（重启不再重放） ----
+    _FIRED_RETAIN_SECS = 3 * 86400
+
+    def _fired_export(self):
+        """导出近 3 天的已触发点（更老的既不会被回补，留着只占空间）。"""
+        now = time.time()
+        out = []
+        for ts, flag in (self._fired or {}).items():
+            if not flag:
+                continue
+            try:
+                ts = float(ts)
+            except (TypeError, ValueError):
+                continue
+            if now - ts <= self._FIRED_RETAIN_SECS:
+                out.append(ts)
+        return out
+
+    def _fired_import(self, values):
+        """从状态文件恢复已触发点。只接受合理范围内的值（防脏数据锁死排程）。"""
+        if not isinstance(values, (list, tuple)):
+            return
+        now = time.time()
+        for v in values:
+            try:
+                ts = float(v)
+            except (TypeError, ValueError):
+                continue
+            # 只恢复「过去 3 天内、且不在未来」的点；异常值一律丢弃
+            if -self._FIRED_RETAIN_SECS <= ts - now <= 0:
+                self._fired[ts] = True
 
     def _load_state(self):
         """读状态文件；不存在/损坏都返回 {}（按全新进程处理）。"""
@@ -307,6 +335,9 @@ class Scheduler(object):
                         k for k in self._fired
                         if isinstance(k, str) and '@' in k)[-8:],
                     "logs": self.logs[-60:],
+                    # issue #130：fired 只在内存里，重启会把 3 小时内的排程点
+                    # 再跑一遍（实测出现两次签到相隔 3 秒）。落盘后重启接得上。
+                    "fired": self._fired_export(),
                     "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 with open(tmp, "w", encoding="utf-8") as fh:
@@ -629,7 +660,9 @@ class Scheduler(object):
                      % (len(stale_uids),
                         "、".join(sorted(str(u)[:8] for u in stale_uids))))
         targets = [a for a in self.pool.accounts
-                   if a.enabled and a.access_token and a.uid not in stale_uids]
+        # issue #102：禁用账号只要开了「暂停期间仍签到」也进签到
+        # targets；stale_uids（凭证失效）始终排除。
+                   if a.checkin_eligible() and a.uid not in stale_uids]
         if cycle_kind == CYCLE_STARTUP:
             # 启动巡检会补做"此刻已到点的窗口"（例如 10:20 打开软件补 10:00
             # 那一轮）。这里把这些窗口当场标记为已触发，避免主循环醒来后又

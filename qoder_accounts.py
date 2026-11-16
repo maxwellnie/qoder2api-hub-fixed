@@ -14,6 +14,7 @@
 """
 import base64
 import collections
+import copy
 import datetime
 import hashlib
 import ipaddress
@@ -30,6 +31,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 import uuid
+import weakref
 
 from qoder_fingerprint import (derive_id, generate_request_id,
                                derive_machine_token, derive_machine_type,
@@ -39,15 +41,370 @@ from qoder_sign import COSY_MACHINE_OS
 # ---------------------------------------------------------------------------
 # 区域常量（逆向自官方桌面/CLI 客户端）
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 用量/积分：跨区域自动探测（issue #141）
+# ---------------------------------------------------------------------------
+# INTL 的额度接口与 CN 不是一套：实测 openapi.qoder.sh 上 /api/v2/quota/usage
+# 常返回 404/403，而官网会话侧的 /sash/api/v1/me/* 才有数据。与其逐个区域写死，
+# 这里维护一份**候选矩阵**（主机 × 路径），按顺序试，第一个解析出数字的就记住：
+#   accounts/credits-source.json = {"intl": {"host": ..., "path": ..., "at": ...}}
+# 之后 fetch_credits 优先用它；探测失败再回退到默认 /api/v2/quota/usage。
+CREDITS_PATHS = (
+    "/api/v2/quota/usage",
+    "/api/v1/quota/usage",
+    "/api/v2/quota",
+    "/api/v2/user/quota",
+    "/api/v2/me/quota",
+    "/api/v2/credits/usage",
+    "/api/v2/credits",
+    "/api/v2/billing/quota",
+    "/sash/api/v1/me/quota",
+    "/sash/api/v1/me/credits",
+    "/sash/api/v1/me/usage",
+)
+CREDITS_SOURCE_FILE = "credits-source.json"
+_CREDITS_PROBE_TTL = 6 * 3600
+
+
+def credits_source_path(accounts_dir):
+    return os.path.join(accounts_dir, CREDITS_SOURCE_FILE)
+
+
+def load_credits_sources(accounts_dir):
+    try:
+        with open(credits_source_path(accounts_dir), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_credits_source(accounts_dir, realm, host, path, fields=None):
+    data = load_credits_sources(accounts_dir)
+    data[str(realm or "cn")] = {"host": host, "path": path,
+                                "fields": list(fields or []),
+                                "at": time.time()}
+    try:
+        os.makedirs(accounts_dir, exist_ok=True)
+        tmp = credits_source_path(accounts_dir) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, credits_source_path(accounts_dir))
+    except Exception:
+        pass
+    return data.get(str(realm or "cn"))
+
+
+def _num_or_none(value):
+    try:
+        if value is None or isinstance(value, bool):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _bucket_from(src, kind, name):
+    """把上游任意额度对象归一成 {name, kind, remain, used, size, expires_at}。"""
+    if isinstance(src, (int, float)) and not isinstance(src, bool):
+        return {"name": name, "kind": kind, "remain": int(src),
+                "used": 0, "size": int(src)}
+    if not isinstance(src, dict):
+        return None
+    remain = _num_or_none(src.get("remaining"))
+    if remain is None:
+        remain = _num_or_none(src.get("remain"))
+    if remain is None:
+        remain = _num_or_none(src.get("balance"))
+    used = _num_or_none(src.get("used"))
+    # 共享池 cap 是成员使用上限（-1 表示不限量），优先于 total。
+    size = _num_or_none(src.get("cap")) if kind == "shared" else None
+    if size is None:
+        size = _num_or_none(src.get("total"))
+    if size is None:
+        size = _num_or_none(src.get("cap"))
+    if size is None:
+        size = _num_or_none(src.get("size"))
+    if size is None and remain is not None and used is not None:
+        size = remain + used
+    if remain is None and size is not None and used is not None:
+        remain = max(0.0, size - used)
+    if remain is None and size is None:
+        return None
+    # 上游把展示名放在 displayLabels[].valueI18n（zh-CN / en-US），优先用它；
+    # 这样「SOTA 专属积分」这类活动包能显示成人话，而不是容器名。
+    label = ""
+    for dl in (src.get("displayLabels") or []):
+        if not isinstance(dl, dict):
+            continue
+        if str(dl.get("dimension") or "") != "title":
+            continue
+        i18n = dl.get("valueI18n") if isinstance(dl.get("valueI18n"), dict) else {}
+        label = str(i18n.get("zh-CN") or i18n.get("en-US")
+                      or dl.get("value") or "").strip()
+        if label:
+            break
+    if not label:
+        label = str(src.get("name") or "").strip()
+    out = {"name": (label or name), "kind": kind,
+           "remain": int(remain or 0), "used": int(used or 0),
+           "size": int(size or 0)}
+    if src.get("available") is not None:
+        out["available"] = _truthy(src.get("available"))
+    if kind == "shared" and out["size"] < 0:
+        out["unlimited"] = True
+    for key in ("expiresAt", "expireAt", "expires_at", "expiredAt",
+                "validUntil", "dueAt"):
+        if src.get(key) is not None:
+            out["expires_at"] = normalize_epoch(src[key])
+            break
+    for key in ("daysLeft", "days_left"):
+        if src.get(key) is not None:
+            out["days_left"] = src[key]
+            break
+    if src.get("noExpiry") is not None:
+        out["no_expiry"] = bool(src.get("noExpiry"))
+    return out
+
+
+_QUOTA_BUCKETS = (
+    # (字段名匹配, kind, 展示名) —— 顺序即优先级
+    (("userquota", "planquota", "subscriptionquota", "basequota", "plan"),
+     "plan", "套餐内 Credits"),
+    (("sota", "sotacredits", "sotaquota", "sotaspecial"),
+     "sota", "SOTA 专属积分"),
+    (("addonquota", "resourcepackage", "resourcepackages", "addon",
+      "package", "packages", "bonus"),
+     "pack", "资源包"),
+    # issue: INTL 实测 —— SOTA 专属积分在 dedicatedResourcePackages 里（数组），
+    # 名字在 displayLabels[].valueI18n（zh-CN: "SOTA 专属积分"）。
+    (("dedicatedresourcepackages", "dedicatedresourcepackage",
+      "exclusivepackages", "sotapackages"),
+     "sota", "专属积分包"),
+    (("orgresourcepackage", "sharedquota", "teamquota", "poolquota",
+      "sharedcredits"),
+     "shared", "共享额度池"),
+)
+
+
+def normalize_quota_payload(payload, realm=""):
+    """把任意区域的额度响应归一成「构成」列表（issue #141）。
+
+    策略：广度优先遍历 JSON，命中字段名（见 _QUOTA_BUCKETS）的 dict/数字就归一成
+    一个 bucket；同一 kind 的多个对象都保留（资源包可能有多份，各有有效期）。
+    返回 {"composition": [...], "remain": N, "used": N, "size": N, "fields": [...]}；
+    一个能识别的都没有时返回 None（调用方据此判「这个端点不适用」）。
+    """
+    if not isinstance(payload, (dict, list)):
+        return None
+    found = []
+    seen = set()
+    queue = [("", payload)]
+    while queue:
+        prefix, node = queue.pop(0)
+        if isinstance(node, dict):
+            for key, val in node.items():
+                low = str(key).lower()
+                kind = name = None
+                for keys, k, label in _QUOTA_BUCKETS:
+                    if low in keys:
+                        kind, name = k, label
+                        break
+                if kind and isinstance(val, (dict, list, int, float)) \
+                        and not isinstance(val, bool):
+                    items = val if isinstance(val, list) else [val]
+                    for idx, item in enumerate(items):
+                        bucket = _bucket_from(item, kind, name)
+                        if bucket:
+                            if len(items) > 1:
+                                bucket["name"] = "%s #%d" % (name, idx + 1)
+                            sig = (bucket["kind"], bucket.get("size"),
+                                   bucket.get("remain"), bucket.get("expires_at"))
+                            if sig not in seen:
+                                seen.add(sig)
+                                found.append(bucket)
+                if isinstance(val, (dict, list)):
+                    queue.append((prefix + "/" + low, val))
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    queue.append((prefix, item))
+    if not found:
+        return None
+    # 顶层用量百分比 / 到期时间（有就带上，不做推断）
+    top = payload if isinstance(payload, dict) else {}
+    out = {
+        "composition": found,
+        "remain": sum(b["remain"] for b in found
+                       if b["kind"] != "shared" and b.get("available", True)),
+        "used": sum(b["used"] for b in found
+                     if b["kind"] != "shared" and b.get("available", True)),
+        "size": sum(b["size"] for b in found
+                     if b["kind"] != "shared" and b.get("available", True)),
+        "fields": sorted({b["kind"] for b in found}),
+    }
+    for key in ("expiresAt", "expireAt", "expires_at"):
+        if top.get(key) is not None:
+            out["expires_at"] = normalize_epoch(top[key])
+            break
+    if top.get("totalUsagePercentage") is not None:
+        out["usage_pct"] = top.get("totalUsagePercentage")
+    if top.get("isQuotaExceeded") is not None:
+        out["exceeded"] = bool(top.get("isQuotaExceeded"))
+    return out
+
+
+VPC_DOMAIN_SUFFIX = "vpc.qoder.com.cn"
+
+
+def parse_vpc_endpoint(value):
+    """把 QD_CN_VPC_ENDPOINT 解析成企业 VPC 的三个官方主机。
+
+    接受实例名（acme）或三个按服务拆分的域名（acme.vpc.qoder.com.cn /
+    acme-openapi.vpc.qoder.com.cn / acme-gateway.vpc.qoder.com.cn）。
+    空值返回 None；路径、端口、凭据、query、fragment 或空白一律拒绝，
+    避免一个值只改掉流程里的一部分端点。
+    """
+    raw = str(value or "")
+    if not raw.strip():
+        return None
+    if raw != raw.strip() or any(ch in raw for ch in "\r\n\t"):
+        raise ValueError("invalid VPC endpoint: surrounding whitespace or "
+                         "control characters")
+    target = raw if "://" in raw else "https://" + raw
+    try:
+        parsed = urllib.parse.urlsplit(target)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("invalid VPC endpoint: malformed host or port")
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname
+            or ":" in parsed.netloc or "?" in raw
+            or port is not None or parsed.username is not None
+            or parsed.password is not None or parsed.query
+            or parsed.fragment or "#" in raw
+            or parsed.path not in ("", "/")):
+        raise ValueError("invalid VPC endpoint: expected an instance name or a "
+                         "domain under %s" % VPC_DOMAIN_SUFFIX)
+    host = parsed.hostname.lower()
+    instance = host
+    if host.endswith("." + VPC_DOMAIN_SUFFIX):
+        instance = host[:-len("." + VPC_DOMAIN_SUFFIX)]
+        if instance.endswith("-openapi"):
+            instance = instance[:-len("-openapi")]
+        elif instance.endswith("-gateway"):
+            instance = instance[:-len("-gateway")]
+    elif "." in host:
+        raise ValueError("invalid VPC endpoint: expected an instance name or a "
+                         "domain under %s" % VPC_DOMAIN_SUFFIX)
+    # 最长服务后缀 -gateway 占 8 字节，推导后的 DNS label 不能超过 63。
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,53}[a-z0-9])?", instance):
+        raise ValueError("invalid VPC endpoint: bad instance name %r" % instance)
+    domain = instance + "." + VPC_DOMAIN_SUFFIX
+    return {
+        "instance": instance,
+        "domain": domain,
+        "website": "https://" + domain,
+        "openapi": "https://" + instance + "-openapi." + VPC_DOMAIN_SUFFIX,
+        "gateway": "https://" + instance + "-gateway." + VPC_DOMAIN_SUFFIX,
+    }
+
+
+_VPC_CN = None
+VPC_CONFIG_ERROR = ""
+try:
+    _VPC_CN = parse_vpc_endpoint(os.environ.get("QD_CN_VPC_ENDPOINT"))
+except ValueError as exc:
+    VPC_CONFIG_ERROR = str(exc)
+
+_VPC_HOSTS = frozenset(
+    urllib.parse.urlsplit(_VPC_CN[key]).hostname.lower()
+    for key in ("website", "openapi", "gateway")
+    if _VPC_CN and urllib.parse.urlsplit(_VPC_CN[key]).hostname
+)
+
+
+def vpc_configured():
+    return _VPC_CN is not None
+
+
+def vpc_instance():
+    return (_VPC_CN or {}).get("instance", "")
+
+
+def vpc_config_error():
+    return VPC_CONFIG_ERROR
+
+
+_VPC_ACCOUNTS = weakref.WeakSet()
+_VPC_SCOPES = weakref.WeakSet()
+_VPC_LOCK = threading.RLock()
+
+
+def _vpc_hosts(config):
+    return frozenset(urllib.parse.urlsplit(config[key]).hostname
+                     for key in ("website", "openapi", "gateway"))
+
+
+class _VpcEndpointScope:
+    """Keep an instance registered while a pre-account credential flow runs."""
+    def __init__(self, config):
+        self.config = dict(config)
+        with _VPC_LOCK:
+            _VPC_SCOPES.add(self)
+
+
+def _configured_vpc_groups():
+    groups = []
+    if _VPC_CN:
+        groups.append(_vpc_hosts(_VPC_CN))
+    with _VPC_LOCK:
+        accounts = list(_VPC_ACCOUNTS)
+        scopes = list(_VPC_SCOPES)
+    for scope in scopes:
+        if scope.config.get("vpc_instance"):
+            groups.append(_vpc_hosts(scope.config))
+    for account in accounts:
+        cfg = account.realm_config()
+        if cfg.get("vpc_instance"):
+            groups.append(_vpc_hosts(cfg))
+    pool = globals().get("_ACTIVE_POOL")
+    if pool is not None:
+        with pool._lock:
+            pending = list(pool.logins.values())
+        for info in pending:
+            if time.time() - info.get("created", 0) <= LOGIN_TTL_SECONDS:
+                cfg = info.get("endpoint_config") or {}
+                if cfg.get("vpc_instance"):
+                    groups.append(_vpc_hosts(cfg))
+    return groups
+
+
+def vpc_endpoint_hosts():
+    return frozenset(host for group in _configured_vpc_groups() for host in group)
+
+
+def is_configured_vpc_host(host):
+    """仅对 QD_CN_VPC_ENDPOINT 推导出的三个主机放行解析级 SSRF 校验。
+
+    企业 VPC 域名通常解析到公司内网地址，通用规则会把它当内网目标拒绝；
+    但这是用户显式配置的固定主机，不是请求里可注入的 URL。
+    """
+    name = str(host or "").strip().strip("[]").lower()
+    return bool(name) and name in vpc_endpoint_hosts()
+
+
 REALM_CONFIGS = {
     "cn": {
         "name": "国内版 (China)",
-        "openapi": "https://openapi.qoder.com.cn",
-        "gateway": "https://gateway.qoder.com.cn",
-        "website": "https://qoder.com.cn",
+        "openapi": (_VPC_CN or {}).get("openapi")
+                   or "https://openapi.qoder.com.cn",
+        "gateway": (_VPC_CN or {}).get("gateway")
+                   or "https://gateway.qoder.com.cn",
+        "website": (_VPC_CN or {}).get("website") or "https://qoder.com.cn",
+        "domain": (_VPC_CN or {}).get("domain") or "qoder.com.cn",
+        "vpc_instance": (_VPC_CN or {}).get("instance", ""),
         "client_id": "1c5e33e1-364d-4ce6-b02c-acaa81274a5c",
         "redirect_uri": "qoder-work-cn://",
-        "domain": "qoder.com.cn",
         "ua": "QoderWork/1.1.75",
         # has_checkin 只是"历史上该区域曾开放 sash 签到"的提示位，**不再作为
         # 门控**：能力改为运行时探测（见 Account.checkin_capability）。官方把
@@ -90,7 +447,7 @@ REALM_CONFIGS = {
 CLIENT_UA = "Go-http-client/2.0"
 LOGIN_TTL_SECONDS = 600
 # 账号文件写入锁（/tasks 并行刷新时多个字段各自 save，必须串行落盘）
-_SAVE_LOCK = threading.Lock()
+_SAVE_LOCK = threading.RLock()
 DEFAULT_USER_TYPE = "personal_professional_trial"
 
 # 业务端点（全部挂 openapi 基址，纯 Bearer，无 COSY 签名）
@@ -114,6 +471,12 @@ PATH_CAMPAIGNS = "/sash/api/v1/me/campaigns"
 #        已领取返回 {"status":"CLAIMED","replayed":true}，不会重复发放）
 PATH_CAMPAIGN_REWARD = "/sash/api/v1/me/campaigns/%s/reward"
 PATH_CAMPAIGN_CLAIM = "/sash/api/v1/me/campaigns/%s/claim"
+# 官方积分消耗（0.4.3 客户端新增；cn/intl 实测均 200）：
+#   summary -> {totalCredits, peakCredits, peakDate, unit}
+#   heatmap -> {items: [{date, value}...]}（近 365 天，按天积分消耗）
+PATH_CREDIT_SUMMARY = "/sash/api/v1/ai-conversations/credits-summary"
+PATH_CREDIT_HEATMAP = "/sash/api/v1/ai-conversations/credits-heatmap"
+PATH_ACHIEVEMENTS = "/sash/api/v1/me/achievements"
 
 # 桌面端专用请求头（活动平台必需；CLI=5 / QoderWork=6 / 桌面端=10）
 DESKTOP_CLIENT_TYPE = "10"
@@ -875,10 +1238,39 @@ CHECKIN_PROBE_TTL = 6 * 3600
 # 活动列表缓存 TTL：活动状态变化很慢（每日一轮），20 秒内复用可让看板切换视图
 # /账号不再等那 1–4 秒的上游请求；领取动作会强制绕过并立即失效缓存。
 CAMPAIGNS_TTL = 20
+# 官方积分消耗/成就属于全量聚合接口：缓存 5 分钟，别跟着面板轮询打
+CREDIT_USAGE_TTL = 300
 
 # 活动平台 claim 请求之间的默认间隔（秒）：调用方（qoder_tasks.run_checkin）的
 # gap 未透传时的安全默认，保持「>= 1.0s 防风控」语义（见 qoder_tasks 模块声明）。
 CLAIM_GAP_DEFAULT = 1.0
+
+def _campaign_list_needs_retry(st, only_kinds=None):
+    """活动列表要不要重试（issue #130）。
+
+    只在「查询成功但**没有可领项**」时重试：空列表、showCampaign=false、
+    或列表里没有任何 claim_status=CLAIMABLE 且属于 only_kinds 的活动。
+    查询本身失败不在这里重试（上层有自己的错误路径）。
+    """
+    if not isinstance(st, dict) or not st.get("ok"):
+        return False
+    items = st.get("campaigns") or []
+    if not items:
+        return True
+    if st.get("show_campaign") is False and not st.get("claimable"):
+        return True
+    for c in items:
+        if not isinstance(c, dict):
+            continue
+        if str(c.get("claim_status") or "").upper() != "CLAIMABLE":
+            continue
+        if only_kinds is not None:
+            kind = str((c.get("benefit") or {}).get("kind") or "").upper()
+            if kind not in only_kinds:
+                continue
+        return False
+    return True
+
 
 def campaign_label(c):
     """活动显示名：官方中文标题（placements content.zh.title）优先，其次 key。"""
@@ -924,15 +1316,18 @@ def _machine_minimal_disabled():
     return raw in ("0", "off", "false", "no", "disable", "disabled")
 
 
-def openapi_candidates(realm):
+def openapi_candidates(realm, cfg=None):
     """该区域 openapi 基址候选（issue: 国际版签不到到）。
 
     官方把业务端点都挂在 openapi 基址上；国际版历史上是 openapi.qoder.sh，
     但该域名在部分网络/时期不可达，表现为「活动列表拿不到 -> 签到无效」。
     这里给出候选顺序，调用方**只在连接失败或 404 时**换下一个，业务错误不重试。
     """
-    cfg = get_realm_config(realm)
+    cfg = cfg if cfg is not None else get_realm_config(realm)
     r = str(realm or "cn")
+    # 专属实例配置优先于遗留的 OPENAPI 覆盖；不得将企业凭据先送往公网。
+    if cfg.get("vpc_instance"):
+        return [str(cfg["openapi"]).rstrip("/")]
     out = []
     env = str(os.environ.get("QD_%s_OPENAPI" % r.upper()) or "").strip()
     if env:
@@ -941,8 +1336,11 @@ def openapi_candidates(realm):
     if base:
         out.append(base)
     domain = str(cfg.get("domain") or "").strip()
-    for host in (("https://openapi." + domain) if domain else "",
-                 str(cfg.get("website") or "").rstrip("/")):
+    # 国际版活动平台另有一个可用入口 center.qoder.sh（0.4.3 客户端仍引用；实测
+    # intl=200 / cn=401），放在官网域名之前作为回退。
+    _extra = ("https://center.qoder.sh",) if r == "intl" else ()
+    for host in _extra + ((("https://openapi." + domain) if domain else ""),
+                          str(cfg.get("website") or "").rstrip("/")):
         if host and host not in out:
             out.append(host)
     return out
@@ -952,16 +1350,74 @@ def get_realm_config(realm):
     return REALM_CONFIGS.get(realm) or REALM_CONFIGS["cn"]
 
 
-def gateway_candidates(realm):
+def normalize_vpc_override(value):
+    """None inherits the deployment default; empty string explicitly uses public CN."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("VPC endpoint must be a string or null")
+    parsed = parse_vpc_endpoint(value)
+    return parsed["instance"] if parsed else ""
+
+
+def realm_config_for(realm, vpc=None):
+    override = normalize_vpc_override(vpc)
+    if realm != "cn":
+        if override:
+            raise ValueError("VPC is only available for CN accounts")
+        return dict(get_realm_config(realm))
+    if override is None:
+        if VPC_CONFIG_ERROR:
+            raise ValueError(VPC_CONFIG_ERROR)
+        return dict(get_realm_config("cn"))
+    cfg = dict(get_realm_config("cn"))
+    parsed = parse_vpc_endpoint(override)
+    cfg.update({"openapi": "https://openapi.qoder.com.cn",
+                "gateway": "https://gateway.qoder.com.cn",
+                "website": "https://qoder.com.cn", "domain": "qoder.com.cn",
+                "vpc_instance": "", "gateway_fallbacks": ()})
+    if parsed:
+        cfg.update({key: parsed[key] for key in ("openapi", "gateway", "website", "domain")})
+        cfg["vpc_instance"] = parsed["instance"]
+    return cfg
+
+
+def account_realm_config(account):
+    # Legacy integrations may pass a minimal account stub without the method.
+    method = getattr(account, "realm_config", None)
+    return method() if callable(method) else get_realm_config(account.realm)
+
+
+def gateway_candidates(realm, cfg=None):
     """该区域的推理主机候选列表（官方客户端同款：主选 + 故障切换域名）。
 
     签名只覆盖 path，因此同一请求换主机后签名依旧有效。
     """
-    cfg = get_realm_config(realm)
+    cfg = cfg if cfg is not None else get_realm_config(realm)
     out = [cfg["gateway"]]
+    # 企业 VPC 只有实例专属推理域，公网 api1/api2/api3 不能作为故障回退。
+    if cfg.get("vpc_instance"):
+        return out
     for host in cfg.get("gateway_fallbacks") or ():
         if host and host not in out:
             out.append(host)
+    return out
+
+
+def cli_auth_dirs(realm, vpc=None):
+    """官方 CLI 的凭据目录：公网 ``.auth`` +（VPC 模式）实例专属 ``.auth``。
+
+    企业 VPC 账号可能由官方 CLI 登录在 ``~/.qoder-cn/.auth``，也可能按
+    实例隔离在 ``~/.qoder-cn/.vpc/<instance>/.auth``；扫描两者，导入时
+    的 realm 仍是 cn。
+    """
+    cfg = realm_config_for(realm, vpc)
+    root = os.path.join(os.path.expanduser("~"), cfg["home_dir"])
+    out = []
+    instance = str(cfg.get("vpc_instance") or "")
+    if instance:
+        out.append(os.path.join(root, ".vpc", instance, ".auth"))
+    out.append(os.path.join(root, ".auth"))
     return out
 
 
@@ -1167,8 +1623,8 @@ def usage_log_path():
     """
     if USAGE_LOG_OVERRIDE:
         return str(USAGE_LOG_OVERRIDE)
-    d = os.environ.get("QD_PROXY_USAGE_DIR") or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "usage")
+    import qoder_logpaths
+    d = qoder_logpaths.resolve_usage_dir(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(d, "usage.jsonl")
 
 
@@ -1238,6 +1694,19 @@ _FAKEIP_NETS = [
     ipaddress.ip_network("2001:2::/48"),
     ipaddress.ip_network("fdfe:dcba:9876::/48"),
 ]
+# macOS 的 getaddrinfo 会把 fake-IP 以 IPv4-translated 形式（::ffff:0:c612:2d）
+# 一并返回；只认纯 IPv4 会让 all(...) 失败，于是所有公网域名都被误判成内网。
+_FAKEIP_V4_TRANSLATED = ipaddress.ip_network("::ffff:0:0:0/96")
+
+
+def _is_fake_ip(ip):
+    candidates = [ip]
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            candidates.append(ip.ipv4_mapped)
+        elif ip in _FAKEIP_V4_TRANSLATED:
+            candidates.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+    return any(addr in net for addr in candidates for net in _FAKEIP_NETS)
 
 
 def _host_boundary_violation(ip, allow_local):
@@ -1264,6 +1733,10 @@ def validate_public_http_url(url, allow_local=False):
     host = (parsed.hostname or "").strip().strip("[]").lower()
     if not host:
         raise ValueError("URL host is required")
+    # 企业 VPC 专属域通常解析到公司内网，不能按公网目标拒绝；只放行
+    # QD_CN_VPC_ENDPOINT 推导出的固定主机。
+    if is_configured_vpc_host(host):
+        return url
     if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
         if not allow_local:
             raise ValueError("requests to localhost are not allowed")
@@ -1289,7 +1762,7 @@ def validate_public_http_url(url, allow_local=False):
             addrs.append(ipaddress.ip_address(addr))
         except ValueError:
             raise ValueError("URL host resolved to a non-IP address: %r" % addr)
-    if addrs and all(any(ip in net for net in _FAKEIP_NETS) for ip in addrs):
+    if addrs and all(_is_fake_ip(ip) for ip in addrs):
         return url  # fake-IP DNS：真实 IP 不可见，名称级校验已通过
     for ip in addrs:
         if _host_boundary_violation(ip, allow_local):
@@ -1352,6 +1825,28 @@ def _proxy_map_from_env():
     return out
 
 
+class _VpcRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """VPC 请求只允许在本实例的 HTTPS 默认端口之间重定向。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        source = urllib.parse.urlsplit(req.full_url)
+        if is_configured_vpc_host(source.hostname):
+            target = urllib.parse.urlsplit(newurl)
+            try:
+                allowed = (target.scheme == "https"
+                           and target.port in (None, 443)
+                           and target.username is None and target.password is None
+                           and any(source.hostname in group and target.hostname in group
+                                   for group in _configured_vpc_groups()))
+            except ValueError:
+                allowed = False
+            if not allowed:
+                raise urllib.error.HTTPError(req.full_url, code,
+                                             "VPC redirect outside configured instance",
+                                             headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _opener_for_request():
     """每请求现建 opener：代理 = 当前环境变量（空 = 直连）。
 
@@ -1359,7 +1854,8 @@ def _opener_for_request():
     首次使用时缓存代理配置；本函数让每次请求看到的环境变化立即生效。
     """
     proxies = _proxy_map_from_env()
-    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies),
+                                       _VpcRedirectHandler())
 
 
 def upstream_clock_skew(timeout=4.0):
@@ -1370,7 +1866,8 @@ def upstream_clock_skew(timeout=4.0):
     """
     from email.utils import parsedate_to_datetime
     try:
-        req = urllib.request.Request("https://openapi.qoder.com.cn/", method="HEAD")
+        base = openapi_candidates("cn")[0]
+        req = urllib.request.Request(base.rstrip("/") + "/", method="HEAD")
         with _opener_for_request().open(req, timeout=timeout) as resp:
             date_hdr = resp.headers.get("Date")
         if not date_hdr:
@@ -1409,6 +1906,27 @@ def http_json(url, data=None, method=None, headers=None, timeout=30,
 # ---------------------------------------------------------------------------
 # Account
 # ---------------------------------------------------------------------------
+# issue #131-4：accounts/ 下与**系统文件/目录**同名的 uid 必须挡住 —— 否则
+# 导入一个 uid="settings" 的账号会写进 accounts/settings.json，把面板密码摘要与
+# API Key 列表整体覆盖（实测会导致默认密码 admin 重新可用、Key 全清）。
+RESERVED_ACCOUNT_UIDS = frozenset({
+"settings", "machine_identity", "usage", "usage-summary",
+"scheduler", "state", "models-cache", "max-output-limits",
+})
+
+
+def is_reserved_account_uid(uid):
+    """该 uid 会不会撞上 accounts/ 里的系统文件（issue #131-4）。"""
+    low = str(uid or "").strip().lower()
+    if not low:
+        return False
+    if low in RESERVED_ACCOUNT_UIDS:
+        return True
+    # 前缀撞车也要挡：models-cache-cn / usage-2026 之类同样是系统命名空间
+    return any(low.startswith(prefix + "-") for prefix in (
+        "models-cache", "max-output-limits", "usage"))
+
+
 class Account(object):
     def __init__(self, data, path=None):
         data = data or {}
@@ -1417,12 +1935,29 @@ class Account(object):
         self.nickname = str(data.get("nickname") or "")
         # issue #69：账号备注（纯展示，不参与任何判定）
         self.note = str(data.get("note") or "")
+        self.group = str(data.get("group") or "").strip()
         self.domain = str(data.get("domain") or "")
         self.realm = str(data.get("realm") or detect_realm_from_domain(self.domain))
         if self.realm not in REALM_CONFIGS:
             self.realm = "cn"
-        if not self.domain:
-            self.domain = get_realm_config(self.realm)["domain"]
+        self.vpc_source = "account"
+        if "vpcEndpoint" in data:
+            override = normalize_vpc_override(data["vpcEndpoint"])
+        elif self.realm == "cn" and self.domain.lower().endswith("." + VPC_DOMAIN_SUFFIX):
+            override = normalize_vpc_override(self.domain)
+            self.vpc_source = "domain"
+        else:
+            override = None
+        self.vpc_override = override
+        cfg = realm_config_for(self.realm, override)
+        self.vpc_endpoint = cfg.get("vpc_instance", "")
+        if override is None:
+            self.vpc_source = "default" if self.vpc_endpoint else "public"
+        elif not override:
+            self.vpc_source = "public"
+        self.domain = cfg["domain"]
+        with _VPC_LOCK:
+            _VPC_ACCOUNTS.add(self)
         self.platform = str(data.get("platform") or "CLI")
         self.access_token = str(data.get("accessToken") or "")
         self.refresh_token = str(data.get("refreshToken") or "")
@@ -1480,6 +2015,11 @@ class Account(object):
             self.last_credits_delta_at = float(data.get("lastCreditsDeltaAt") or 0)
         except (TypeError, ValueError):
             self.last_credits_delta_at = 0.0
+        # issue #102：禁用只表示「不接推理流量」，不等于「不签到」。
+        # 默认关闭 = 维持历史行为（禁用即全停）。
+        self.checkin_when_disabled = bool(data.get("checkinWhenDisabled"))
+        self._credit_usage_cache = None   # (ts, payload) 官方积分消耗
+        self._achievements_cache = None   # (ts, payload) 已获成就
         # 已领取活动的兑换码（如「奶茶免单卡」REDEMPTION_CODE）：活动只发一次，
         # 必须落盘持久化，否则网关重启后用户就找不回兑换码了。
         self.campaign_codes = dict(data.get("campaignCodes") or {})
@@ -1506,12 +2046,29 @@ class Account(object):
         self.machine_headers_state = MACHINE_HEADERS_OMITTED
 
     # -- 持久化 ------------------------------------------------------------
+    def realm_config(self):
+        return realm_config_for(self.realm, self.vpc_override)
+
+    def endpoint_scope(self):
+        cfg = self.realm_config()
+        return (self.realm + ":vpc:" + cfg["vpc_instance"]
+                if cfg.get("vpc_instance") else self.realm)
+
+    def _credits_source_allowed(self, host):
+        cfg = self.realm_config()
+        if cfg.get("vpc_instance"):
+            return host in (cfg["openapi"], cfg["website"])
+        name = (urllib.parse.urlsplit(host).hostname or "").lower()
+        return not name.endswith("." + VPC_DOMAIN_SUFFIX)
+
     def to_dict(self):
         return {
             "uid": self.uid,
             "nickname": self.nickname,
+            "group": self.group,
             "domain": self.domain,
             "realm": self.realm,
+            "vpcEndpoint": self.vpc_override,
             "platform": self.platform,
             "accessToken": self.access_token,
             "refreshToken": self.refresh_token,
@@ -1529,6 +2086,7 @@ class Account(object):
             "lastCheckin": self.last_checkin,
             "lastCreditsDelta": self.last_credits_delta,
             "lastCreditsDeltaAt": self.last_credits_delta_at,
+            "checkinWhenDisabled": bool(self.checkin_when_disabled),
             "campaignCodes": self.campaign_codes,
             "campaignBlockedUntil": self.campaign_blocked_until,
             "userType": self.user_type,
@@ -1536,6 +2094,22 @@ class Account(object):
             "organizationName": self.organization_name,
             "note": self.note,
         }
+
+    def inference_eligible(self):
+        """能否接推理流量：启用 + 有凭证（历史语义，未改）。"""
+        return bool(self.enabled and self.access_token)
+
+    def checkin_eligible(self):
+        """能否参与签到/领福利（issue #102）。
+
+        与推理口径解耦：只要凭证在，禁用账号也可以照常签到（账号级白拿的
+        每日奖励），前提是该账号显式打开了「暂停期间仍签到」。
+        凭证失效（无 access_token）一律不参与——signin 必然失败，还会用退化
+        响应覆盖余额快照。过期判定由调用方（调度器 stale_uids）负责。
+        """
+        if not self.access_token:
+            return False
+        return bool(self.enabled or self.checkin_when_disabled)
 
     def is_team(self):
         """是否团队 / 企业账号（issue #90）。
@@ -1574,8 +2148,12 @@ class Account(object):
         return {
             "uid": self.uid,
             "nickname": self.nickname or (self.uid[:8] if self.uid else "?"),
+            "group": self.group,
             "domain": self.domain,
             "realm": self.realm,
+            "vpcEndpoint": self.vpc_endpoint,
+            "vpcOverride": self.vpc_override,
+            "vpcSource": self.vpc_source,
             "platform": self.platform,
             "enabled": bool(self.enabled),
             "source": self.source,
@@ -1628,6 +2206,7 @@ class Account(object):
             "lastCheckinDate": str(self.last_checkin or "")[:10],
             "lastCreditsDelta": self.last_credits_delta,
             "lastCreditsDeltaAt": self.last_credits_delta_at,
+            "checkinWhenDisabled": bool(self.checkin_when_disabled),
             "checkinCapability": ("unknown" if self.checkin_capability()[0] is None
                                   else ("available" if self.checkin_capability()[0]
                                         else "not_found")),
@@ -1645,6 +2224,9 @@ class Account(object):
         base = Path(directory).resolve()
         base.mkdir(parents=True, exist_ok=True)
         safe_uid = re.sub(r"[^A-Za-z0-9_-]", "_", str(self.uid or "")).strip("_ ")
+        if is_reserved_account_uid(safe_uid):
+            # 双重防线：即使上游没拦住，落盘这一步也不许覆盖系统文件。
+            raise ValueError("reserved account uid: %r" % safe_uid)
         name = (safe_uid or uuid.uuid4().hex) + ".json"
         path = base / name
         tmp = base / (name + ".tmp")
@@ -1653,11 +2235,14 @@ class Account(object):
         # 并发保护：/tasks 面板接口会并行刷新同一账号的多个字段（credits/plan/…），
         # 每个都可能触发 save；同一 tmp 路径被两个线程同时写会落出坏 JSON。
         with _SAVE_LOCK:
+            if getattr(self, "_superseded", False):
+                return str(path)  # obsolete refresh cannot overwrite endpoint edits
             tmp.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
                            encoding="utf-8")
             os.replace(tmp, path)
         self.path = str(path)
         return self.path
+
     def delete(self):
         if self.path and os.path.exists(self.path):
             os.remove(self.path)
@@ -2025,7 +2610,7 @@ class Account(object):
 
     # -- 出站头 ------------------------------------------------------------
     def headers(self, purpose="openapi"):
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         return {
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
@@ -2133,7 +2718,7 @@ class Account(object):
 
         PAT 永不覆盖活跃的 OAuth 会话，只做 jrt- 过期后的最终兜底。
         """
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         base = cfg["openapi"]
         # 1) OAuth 设备族
         if self.refresh_token.startswith("drt-"):
@@ -2157,7 +2742,7 @@ class Account(object):
             "Content-Type": "application/json",
             "Accept": "application/json",
             # 与 headers() 同口径：token 刷新同样要发官方客户端 UA。
-            "User-Agent": get_realm_config(self.realm).get("ua") or CLIENT_UA,
+            "User-Agent": self.realm_config().get("ua") or CLIENT_UA,
         }
         try:
             data = http_json(url, data=json.dumps(payload).encode(), method="POST",
@@ -2262,7 +2847,7 @@ class Account(object):
         if q is None:
             body = _err or ""
             if _code in (404, 405, 410):
-                mark_openapi_missing(self.realm, PATH_CHECKIN_STATUS)
+                mark_openapi_missing(self.endpoint_scope(), PATH_CHECKIN_STATUS)
                 self._mark_checkin_capability(
                     False, "%s (HTTP %d)" % (CHECKIN_REASON_NOT_FOUND, _code))
                 return False, {
@@ -2369,6 +2954,71 @@ class Account(object):
         return {"ok": True, "msg": "签到成功 +%d 积分" % reward,
                 "reward_credits": reward}
 
+    def fetch_credit_usage(self, days=365, force=False):
+        """官方积分消耗（0.4.3 客户端新增接口）。
+
+        返回 {ok, total, peak, peak_date, daily:[{date, value}], unit, error?}：
+          total      —— 窗口内累计消耗积分（官方口径，不是我们的 token 估算）
+          peak       —— 单日峰值；peak_date 对应日期
+          daily      —— 逐日消耗，可直接画热力图
+        结果缓存 CREDIT_USAGE_TTL 秒（该接口是全量聚合，别跟着 5 秒轮询打）。
+        """
+        now = time.time()
+        if not force and self._credit_usage_cache \
+                and now - self._credit_usage_cache[0] < CREDIT_USAGE_TTL:
+            return self._credit_usage_cache[1]
+        q_sum, code, err = self._openapi_json(PATH_CREDIT_SUMMARY,
+                                              headers=self.desktop_headers(),
+                                              timeout=15, retries=1)
+        if not isinstance(q_sum, dict):
+            out = {"ok": False, "error": err or ("HTTP %s" % code),
+                   "total": 0, "peak": 0, "peak_date": "", "daily": [],
+                   "unit": "credits"}
+            self._credit_usage_cache = (now, out)
+            return out
+        q_heat, _c2, _e2 = self._openapi_json(PATH_CREDIT_HEATMAP,
+                                              headers=self.desktop_headers(),
+                                              timeout=20, retries=1)
+        daily = []
+        if isinstance(q_heat, dict):
+            for item in (q_heat.get("items") or []):
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    daily.append({"date": str(item.get("date") or ""),
+                                  "value": float(item.get("value") or 0)})
+                except (TypeError, ValueError):
+                    continue
+        out = {
+            "ok": True,
+            "total": float(q_sum.get("totalCredits") or 0),
+            "peak": float(q_sum.get("peakCredits") or 0),
+            "peak_date": str(q_sum.get("peakDate") or ""),
+            "unit": str(q_sum.get("unit") or "credits"),
+            "daily": daily[-int(days):] if days else daily,
+        }
+        self._credit_usage_cache = (now, out)
+        return out
+
+    def fetch_achievements(self, force=False):
+        """已获得的成就 key 列表（用于解释活动「需先完成某成就」）。"""
+        now = time.time()
+        if not force and self._achievements_cache \
+                and now - self._achievements_cache[0] < CREDIT_USAGE_TTL:
+            return self._achievements_cache[1]
+        q, code, err = self._openapi_json(PATH_ACHIEVEMENTS,
+                                          headers=self.headers(),
+                                          timeout=15, retries=1)
+        keys = []
+        if isinstance(q, dict):
+            for item in (q.get("achievements") or []):
+                if isinstance(item, dict) and item.get("achievementKey"):
+                    keys.append(str(item["achievementKey"]))
+        out = {"ok": isinstance(q, dict), "keys": keys,
+               "error": "" if isinstance(q, dict) else (err or ("HTTP %s" % code))}
+        self._achievements_cache = (now, out)
+        return out
+
     def _refresh_credits_quietly(self):
         """签到/领奖后顺手刷新余额（best-effort，绝不抛）。"""
         try:
@@ -2387,10 +3037,10 @@ class Account(object):
         last = (None, 0, "no openapi candidate")
         # 已知 404：直接返回（否则 intl 的 legacy 端点每次都要 0.x~10s 才失败，
         # 签到因此慢到不可用；TTL 6h 后允许重探，端点上线仍能被发现）。
-        if openapi_missing(self.realm, path):
+        if openapi_missing(self.endpoint_scope(), path):
             return None, 404, "cached 404 (known missing in %s)" % self.realm
         tried = 0
-        _bases = openapi_candidates(self.realm)
+        _bases = openapi_candidates(self.realm, self.realm_config())
         if not fallback:
             _bases = _bases[:1]
         for base in _bases:
@@ -2409,7 +3059,7 @@ class Account(object):
                 last = (None, exc.code, "HTTP %d %s" % (exc.code, body[:120]))
                 if exc.code in (404, 405, 410):
                     if tried >= 2:
-                        mark_openapi_missing(self.realm, path)
+                        mark_openapi_missing(self.endpoint_scope(), path)
                         return last
                     continue          # 首个基址 404：再试一个候选
                 return last
@@ -2464,7 +3114,7 @@ class Account(object):
                 and getattr(self, "machine_headers_state", "") == MACHINE_HEADERS_OMITTED \
                 and not _machine_minimal_disabled():
             try:
-                q2 = http_json(get_realm_config(self.realm)["openapi"] + PATH_CAMPAIGNS,
+                q2 = http_json(self.realm_config()["openapi"] + PATH_CAMPAIGNS,
                                method="GET",
                                headers=self.desktop_headers(minimal=True),
                                timeout=15, retries=1)
@@ -2565,7 +3215,7 @@ class Account(object):
 
     def campaign_reward(self, campaign_id):
         """GET …/campaigns/{id}/reward -> 该活动的发放状态（幂等，只读）。"""
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         url = cfg["openapi"] + (PATH_CAMPAIGN_REWARD % campaign_id)
         try:
             return http_json(url, method="GET", headers=self.desktop_headers(),
@@ -2583,7 +3233,7 @@ class Account(object):
             （实测：同机多号共享每轮一次的额度，第二个号会被 BLOCKED 且列表里
             隐藏该活动——官方文档写"每账号"，实际执行是"每人"）。
         """
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         url = cfg["openapi"] + (PATH_CAMPAIGN_CLAIM % campaign_id)
         try:
             headers = self.desktop_headers()
@@ -2675,7 +3325,20 @@ class Account(object):
         # force 会让每次签到都换一套身份并把落盘缓存刷掉，「重建不换」就失效了
         # （设计 §9.1）。身份真被服务端作废时由 campaigns() 的自愈兜底刷新。
         native_machine_identity(self.realm, self.uid)
+        # issue #130：同一请求上游偶发返回「没有每日活动 / claimable=false」
+        # （报告者实测 10 次里 2 次），一次空结果就放弃会让当天签到直接丢掉。
+        # 这里对**空结果/无可领项**重试两次（0.8s、2.0s 退避），拿到可领项即停。
         st = self.campaigns(force=True)      # 领取路径必须绕过缓存，看最新状态
+        for _wait in (0.8, 2.0):
+            if not _campaign_list_needs_retry(st, only_kinds):
+                break
+            try:
+                time.sleep(_wait)
+            except Exception:
+                pass
+            _retry = self.campaigns(force=True)
+            if _retry.get("ok"):
+                st = _retry
         if not st.get("ok"):
             next_at, next_note = next_checkin_window()
             return {"ok": False, "error": st.get("error") or "campaigns 查询失败",
@@ -2863,6 +3526,9 @@ class Account(object):
         打另一区的 quota 会成功。只在 403 时探测一次，不发任何写操作。
         返回可读提示字符串；不属于该情形返回空串。
         """
+        if self.realm_config().get("vpc_instance") or get_realm_config(
+                "cn" if self.realm != "cn" else "intl").get("vpc_instance"):
+            return ""  # 不将任何令牌用于 VPC / 公网之间的跨区试探。
         other = "cn" if self.realm != "cn" else "intl"
         try:
             url = get_realm_config(other)["openapi"] + PATH_QUOTA
@@ -2879,9 +3545,165 @@ class Account(object):
                 "请在面板重新扫描/导入该账号（或把 realm 改成 %s）"
                 % (name, other))
 
+    # -- 用量端点自动探测（issue #141） -------------------------------
+    def probe_credits_endpoints(self, accounts_dir=None, limit=None):
+        """按「主机 × 路径」候选矩阵探测额度接口，返回逐项结果。
+
+        limit: 只探测前 N 个候选（None = 全部）。命中者写入
+        accounts/credits-source.json，之后 fetch_credits 优先用它。
+        """
+        cfg = self.realm_config()
+        hosts = []
+        for h in (cfg.get("openapi"), cfg.get("website")):
+            h = str(h or "").rstrip("/")
+            if h and h not in hosts:
+                hosts.append(h)
+        # 已知来源优先：命中过就第一个试，正常情况下 1 次请求就返回。
+        known = load_credits_sources(accounts_dir or "").get(self.endpoint_scope())
+        order = []
+        if (isinstance(known, dict) and known.get("host") and known.get("path")
+                and self._credits_source_allowed(str(known["host"]).rstrip("/"))):
+            order.append((str(known["host"]).rstrip("/"), str(known["path"])))
+        for host in hosts:
+            for path in CREDITS_PATHS:
+                if (host, path) not in order:
+                    order.append((host, path))
+        if limit is None:
+            limit = 4          # 默认只试 4 个：面板 90s 超时之外的候选没意义
+        rows = []
+        hit = None
+        tried = 0
+        for host, path in order:
+            if True:
+                if limit is not None and tried >= limit:
+                    break
+                tried += 1
+                url = host + path
+                row = {"url": url, "host": host, "path": path,
+                       "status": None, "ok": False, "fields": []}
+                try:
+                    body = http_json(url, method="GET",
+                                      headers=self.headers(),
+                                      timeout=8, retries=0)
+                except urllib.error.HTTPError as exc:
+                    row["status"] = exc.code
+                    rows.append(row)
+                    continue
+                except Exception as exc:
+                    row["status"] = 0
+                    row["error"] = str(exc)[:120]
+                    rows.append(row)
+                    continue
+                row["status"] = 200
+                norm = normalize_quota_payload(body, self.realm)
+                if norm:
+                    row["ok"] = True
+                    row["fields"] = norm["fields"]
+                    row["composition"] = norm["composition"]
+                    if hit is None:
+                        hit = (host, path, norm)
+                else:
+                    row["note"] = "200 but no recognizable quota fields"
+                rows.append(row)
+            if limit is not None and tried >= limit:
+                break
+        if hit and accounts_dir:
+            save_credits_source(accounts_dir, self.endpoint_scope(), hit[0], hit[1],
+                                hit[2]["fields"])
+        return {"ok": bool(hit), "realm": self.realm, "rows": rows,
+                "hit": ({"host": hit[0], "path": hit[1],
+                         "composition": hit[2]["composition"]}
+                        if hit else None)}
+
+    def _credits_from_composition(self, norm):
+        """把归一化的「构成」落成 credits 结构（issue #141）。"""
+        comp = list(norm.get("composition") or [])
+        shared = next((b for b in comp if b.get("kind") == "shared"), None)
+        shared_remain = int(shared.get("remain") or 0) if (
+            shared and shared.get("available", True)
+            and not shared.get("unlimited")) else 0
+        previous = effective_remain(self.credits)
+        packages = []
+        for b in comp:
+            if b.get("kind") == "shared":
+                continue
+            item = {"name": b.get("name") or "额度",
+                    "remain": int(b.get("remain") or 0),
+                    "used": int(b.get("used") or 0),
+                    "size": int(b.get("size") or 0),
+                    "kind": b.get("kind") or "pack"}
+            for key in ("expires_at", "days_left", "no_expiry"):
+                if b.get(key) is not None:
+                    item[key] = b[key]
+            packages.append(item)
+        self.credits = {
+            "remain": int(norm.get("remain") or 0),
+            "remain_effective": int(norm.get("remain") or 0) + shared_remain,
+            "used": int(norm.get("used") or 0),
+            "size": int(norm.get("size") or 0),
+            "exceeded": bool(norm.get("exceeded")),
+            "usage_pct": norm.get("usage_pct"),
+            "expires_at": norm.get("expires_at"),
+            "shared": shared,
+            "packages": packages,
+            # issue #141：构成明细（套餐内 / 资源包 / SOTA / 共享池）
+            "composition": comp,
+            "source": norm.get("source") or "",
+            "updated_at": time.time(),
+            "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        current = self.credits["remain_effective"]
+        try:
+            if previous is not None and int(previous) != current:
+                self.last_credits_delta = current - int(previous)
+                self.last_credits_delta_at = time.time()
+        except (TypeError, ValueError, OverflowError):
+            pass  # 旧快照的坏数值不能阻止本次有效查询。
+        self.last_quota_anomaly = None
+        self.credits_degraded = None
+        self.revive_balance_cooldown()
+        if self.path and os.path.exists(os.path.dirname(self.path)):
+            self.save(os.path.dirname(self.path))
+        return {"ok": True, "credits": self.credits}
+
+    def _fetch_credits_via_source(self, accounts_dir, src):
+        """按已探测到的端点取额度；失败返回 None（调用方回退默认路径）。"""
+        if not isinstance(src, dict):
+            return None
+        host = str(src.get("host") or "").rstrip("/")
+        path = str(src.get("path") or "")
+        if not host or not path:
+            return None
+        cfg = self.realm_config()
+        if not self._credits_source_allowed(host):
+            return None  # 忽略公网或其它实例遗留的额度来源缓存。
+        try:
+            body = http_json(host + path, method="GET", headers=self.headers(),
+                             timeout=20, retries=0)
+        except Exception:
+            return None
+        norm = normalize_quota_payload(body, self.realm)
+        # size 不含共享池：仅共享额度时为 0；个人全 0 退化体仍不采纳。
+        if not norm or (not norm.get("size") and "shared" not in norm["fields"]):
+            return None
+        norm["source"] = host + path
+        return self._credits_from_composition(norm)
+
     def fetch_credits(self):
-        """GET /api/v2/quota/usage -> 聚合基础额度 + 赠送/签到额度。"""
-        cfg = get_realm_config(self.realm)
+        """GET /api/v2/quota/usage -> 聚合基础额度 + 赠送/签到额度。
+
+        issue #141：INTL 上这个端点经常 404/403，所以先用**自动探测**到的
+        （主机, 路径）组合；没有记录或取不到时再走默认路径，全部失败则
+        触发一次探测并重试——探测结果按区域缓存 6 小时。
+        """
+        _dir = os.path.dirname(self.path) if self.path else None
+        _srcs = load_credits_sources(_dir) if _dir else {}
+        _src = _srcs.get(self.endpoint_scope())
+        if _src:
+            _hit = self._fetch_credits_via_source(_dir, _src)
+            if _hit:
+                return _hit
+        cfg = self.realm_config()
         url = cfg["openapi"] + PATH_QUOTA
         hint = ""
         try:
@@ -2895,6 +3717,15 @@ class Account(object):
                     q = http_json(url, method="GET",
                                   headers=self.desktop_headers(), timeout=30)
                 except Exception as exc2:
+                    # issue #141：默认端点失败 -> 主动探测一次（限 6 个候选），
+                    # 命中就立刻改用新端点，别让 INTL 用户一直看到 0/0。
+                    if _dir:
+                        _probe = self.probe_credits_endpoints(_dir, limit=6)
+                        if _probe.get("hit"):
+                            _retry = self._fetch_credits_via_source(
+                                _dir, _probe["hit"])
+                            if _retry:
+                                return _retry
                     hint = self._other_realm_quota_hint()
                     return {
                         "ok": False,
@@ -2904,8 +3735,21 @@ class Account(object):
                                     (" ｜ " + hint) if hint else ""),
                     }
             else:
+                if _dir:
+                    _probe = self.probe_credits_endpoints(_dir, limit=6)
+                    if _probe.get("hit"):
+                        _retry = self._fetch_credits_via_source(
+                            _dir, _probe["hit"])
+                        if _retry:
+                            return _retry
                 return {"ok": False, "http": exc.code, "error": str(exc)}
         except Exception as exc:
+            if _dir:
+                _probe = self.probe_credits_endpoints(_dir, limit=6)
+                if _probe.get("hit"):
+                    _retry = self._fetch_credits_via_source(_dir, _probe["hit"])
+                    if _retry:
+                        return _retry
             return {"ok": False, "error": str(exc)}
         # #25-d：非 dict 响应（解析失败形态）直接走退化路径——旧实现会在这里
         # 抛 AttributeError，且不留任何现场。
@@ -2950,6 +3794,15 @@ class Account(object):
         remain = int(_num(uq, "remaining") + _num(aq, "remaining"))
         used = int(_num(uq, "used") + _num(aq, "used"))
         size = int(_num(uq, "total") + _num(aq, "total"))
+        # issue #141 后续：老口径只累加 userQuota + addOnQuota，**漏掉 SOTA 专属积分**
+        # 之类的新容器（INTL 实测 1800 资源包 + 2000 SOTA，面板却只显示 1800）。
+        # 归一器认得这些容器，就用它的合计覆盖；共享池照旧单列（组织级去重）。
+        _norm = normalize_quota_payload(q, self.realm) or {}
+        _comp = _norm.get("composition") or []
+        if _comp:
+            remain = int(_norm.get("remain") or remain)
+            size = int(_norm.get("size") or size)
+            used = int(_norm.get("used") or used)
         # ---- #25-d：退化 body 合理性守卫（保守）--------------------------
         # 形态（naonao 实测）：isQuotaExceeded=true + 两个 quota 全 0/缺键。
         # 判定**不依赖** expiresAt=253402214400——那是 CN 号「永不过期」的
@@ -2960,8 +3813,14 @@ class Account(object):
         # 保守性：任一信号单独出现都放行——真·余额归零与新号不受影响。
         both_missing = (not isinstance(q.get("userQuota"), dict)
                         and not isinstance(q.get("addOnQuota"), dict))
+        if both_missing and _comp:
+            # 组织成员可只返回 orgResourcePackage，缺个人额度不代表查询失败。
+            _norm["source"] = url
+            return self._credits_from_composition(_norm)
+        has_shared = any(b.get("kind") == "shared" for b in _comp)
         degenerate = both_missing or (bool(q.get("isQuotaExceeded"))
-                                      and remain == 0 and size == 0)
+                                      and remain == 0 and size == 0
+                                      and not has_shared)
         if degenerate:
             return self._note_quota_anomaly(
                 q, "both quota objects missing" if both_missing
@@ -3032,9 +3891,29 @@ class Account(object):
             "expires_at": normalize_epoch(q.get("expiresAt")),
             "shared": shared,
             "packages": _pkgs,
+            # issue #141：把响应归一成「构成」（套餐内 / 资源包 / SOTA / 共享池）。
+            # 归一器认得字段名，认不出就为空——不臆造。
+            "composition": _comp,
+            "source": url,
             "updated_at": time.time(),
             "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        # 旧解析只认 userQuota + addOnQuota，SOTA 等容器会被漏掉，于是面板
+        # 「剩余」比官方少一块（现场：官方 1800+2000=3800，网关只显示 1800）。
+        # 有构成时以构成为准重算主数字（不含共享池——组织级、单独去重）。
+        _comp = [b for b in (self.credits.get("composition") or [])
+                 if b.get("kind") != "shared"]
+        if _comp:
+            _r = sum(int(b.get("remain") or 0) for b in _comp)
+            _u = sum(int(b.get("used") or 0) for b in _comp)
+            _s = sum(int(b.get("size") or 0) for b in _comp)
+            if _r or _s:
+                self.credits["remain"] = _r
+                self.credits["used"] = _u
+                self.credits["size"] = _s
+                _shared_remain = int((shared or {}).get("remain") or 0) \
+                    if (shared and shared.get("available", True)) else 0
+                remain_effective = int(_r) + _shared_remain
         # 面板用：积分变化（正=进账、负=消耗）。只在数值真的变了时更新，
         # 同日多次刷新保留最后一次，避免签到 +100 被后续刷新覆盖成 0。
         try:
@@ -3053,7 +3932,7 @@ class Account(object):
 
     def fetch_plan(self):
         """GET /api/v2/user/plan -> 套餐名（Pro Trial 等）。"""
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         url = cfg["openapi"] + PATH_PLAN
         try:
             p = http_json(url, method="GET", headers=self.headers(), timeout=15,
@@ -3069,7 +3948,7 @@ class Account(object):
 
     # -- Pro 升级包（一次性 +1800） ---------------------------------------
     def pro_eligibility(self):
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         url = cfg["openapi"] + PATH_PRO_ELIGIBILITY
         try:
             m = http_json(url, method="GET", headers=self.headers(), timeout=15,
@@ -3084,7 +3963,7 @@ class Account(object):
             return False, str(exc)
 
     def pro_claim(self):
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         url = cfg["openapi"] + PATH_PRO_CLAIM
         try:
             m = http_json(url, data=b"{}", method="POST", headers=self.headers(),
@@ -3508,11 +4387,12 @@ class AccountPool(object):
                     self.accounts.append(account)
             return self.accounts
 
-    def list_public(self, realm=None):
+    def list_public(self, realm=None, group=None):
         with self._lock:
             accs = self.accounts if (not realm or realm == "all") else \
                 [a for a in self.accounts if a.realm == realm]
-            return [a.public() for a in accs]
+            return [a.public() for a in accs
+                    if group is None or a.group == str(group).strip()]
 
     def get(self, uid):
         with self._lock:
@@ -3525,6 +4405,8 @@ class AccountPool(object):
         with self._lock:
             existing = self.get(account.uid)
             if existing is not None:
+                if existing.realm_config()["domain"] != account.realm_config()["domain"]:
+                    raise ValueError("account uid already belongs to a different endpoint; use a distinct uid")
                 account.added_at = existing.added_at
                 account.path = existing.path
                 if not account.credits and existing.credits:
@@ -3689,22 +4571,56 @@ class AccountPool(object):
         return self.quota_refresher
 
     # -- 选择与健康 --------------------------------------------------------
-    def count_ready(self, realm=None, model=None):
+    def scope_uids(self, account_ids=None, account_groups=None, realm=None):
+        """Resolve selectors: IDs OR groups, intersected with realm.
+
+        Empty/missing selectors mean unrestricted (None); a configured selector
+        with no matching accounts returns an empty set, never an unrestricted pool.
+        The caller must recompute this scope for every request after group edits.
+        """
+        def values(raw):
+            if raw is None:
+                return set()
+            if isinstance(raw, str):
+                raw = [raw]
+            if not isinstance(raw, (list, tuple, set, frozenset)):
+                raise ValueError("account selectors must be lists")
+            if any(not isinstance(value, str) for value in raw):
+                raise ValueError("account selectors must contain strings")
+            return {value.strip() for value in raw}
+
+        ids, groups = values(account_ids), values(account_groups)
+        if not ids and not groups:
+            return None
         with self._lock:
-            snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+            return {a.uid for a in self.accounts
+                    if (not realm or realm == "all" or a.realm == realm)
+                    and (a.uid in ids or a.group in groups)}
+
+    def count_ready(self, realm=None, model=None, allowed_uids=None):
+        with self._lock:
+            snapshot = [a for a in self.accounts
+                        if (not realm or a.realm == realm)
+                        and (allowed_uids is None or a.uid in allowed_uids)]
         return sum(1 for a in snapshot if a.enabled and a.access_token and
                    a.ready(model=model))
 
-    def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None):
+    def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None,
+                         allowed_uids=None):
         exclude = exclude or set()
+        allowed = None if allowed_uids is None else frozenset(allowed_uids)
         if session_key:
             bound_uid = self.affinity.get(session_key)
-            if bound_uid and bound_uid not in exclude:
+            if bound_uid:
                 account = self.get(bound_uid)
-                if account and account.realm == realm and account.ready(model=model):
+                if (bound_uid not in exclude and
+                        (allowed is None or bound_uid in allowed) and account and
+                        (not realm or account.realm == realm) and
+                        account.ready(model=model)):
                     return account
                 self.affinity.unbind(session_key)
-        account = self.pick(realm=realm, exclude=exclude, model=model)
+        account = self.pick(realm=realm, exclude=exclude, model=model,
+                            allowed_uids=allowed)
         if account and session_key:
             self.affinity.bind(session_key, account.uid)
         return account
@@ -3751,11 +4667,13 @@ class AccountPool(object):
                     state.pop(uid, None)
         return winner
 
-    def _pick_expiring_first(self, realm=None, exclude=None, model=None):
+    def _pick_expiring_first(self, realm=None, exclude=None, model=None, allowed_uids=None):
         """窗口内（临期）的可用账号里做加权轮询；没有候选 -> None（由 pick 回落）。"""
         exclude = exclude or set()
         with self._lock:
-            snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+            snapshot = [a for a in self.accounts
+                        if (not realm or a.realm == realm)
+                        and (allowed_uids is None or a.uid in allowed_uids)]
         cands = [a for a in snapshot
                  if a.uid not in exclude and a.ready(model=model)
                  and a.in_expiring_window()]
@@ -3763,7 +4681,7 @@ class AccountPool(object):
             return None
         return self._weighted_pick(cands)
 
-    def _rotate_pick(self, realm=None, exclude=None, model=None):
+    def _rotate_pick(self, realm=None, exclude=None, model=None, allowed_uids=None):
         """纯 round-robin + 两轮降权扫描（task-74 三族之三）。
 
         第一轮先跳过降权窗口内的账号（degraded()），第二轮不跳过——降权号仍然
@@ -3772,7 +4690,9 @@ class AccountPool(object):
         """
         exclude = exclude or set()
         with self._lock:
-            snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+            snapshot = [a for a in self.accounts
+                        if (not realm or a.realm == realm)
+                        and (allowed_uids is None or a.uid in allowed_uids)]
             start = self._cursor
         total = len(snapshot)
         if total == 0:
@@ -3792,21 +4712,24 @@ class AccountPool(object):
                     return account
         return None
 
-    def pick(self, realm=None, exclude=None, model=None):
+    def pick(self, realm=None, exclude=None, model=None, allowed_uids=None):
         """选号：临期积分优先（平滑加权），否则回落普通轮转。
 
         `expiring_window_days` 默认 0（R7）-> in_expiring_window() 恒 False ->
         _pick_expiring_first 返回 None -> 与旧的纯 round-robin **完全一致**。
         """
         account = self._pick_expiring_first(realm=realm, exclude=exclude,
-                                            model=model)
+                                            model=model, allowed_uids=allowed_uids)
         if account is not None:
             return account
-        return self._rotate_pick(realm=realm, exclude=exclude, model=model)
+        return self._rotate_pick(realm=realm, exclude=exclude, model=model,
+                                 allowed_uids=allowed_uids)
 
-    def representative(self, realm=None):
+    def representative(self, realm=None, allowed_uids=None):
         with self._lock:
-            candidates = [a for a in self.accounts if not realm or a.realm == realm]
+            candidates = [a for a in self.accounts
+                          if (not realm or a.realm == realm)
+                          and (allowed_uids is None or a.uid in allowed_uids)]
             for account in candidates:
                 if account.access_token:
                     return account
@@ -3822,6 +4745,38 @@ class AccountPool(object):
         account.save(self.dir)
         return account.public()
 
+    def set_vpc(self, uid, value):
+        """Publish a snapshot so in-flight requests keep their original endpoint."""
+        override = normalize_vpc_override(value)
+        with self._lock:
+            existing = self.get(uid)
+            if existing is None:
+                return None
+            realm_config_for(existing.realm, override)
+            data = existing.to_dict()
+            data["vpcEndpoint"] = override
+            validated = Account(data, existing.path)
+            replacement = copy.copy(existing)
+            replacement.vpc_override = validated.vpc_override
+            replacement.vpc_endpoint = validated.vpc_endpoint
+            replacement.vpc_source = validated.vpc_source
+            replacement.domain = validated.domain
+            with _VPC_LOCK:
+                _VPC_ACCOUNTS.add(replacement)
+            if existing.realm_config()["domain"] != replacement.realm_config()["domain"]:
+                replacement.credits = replacement.plan = None
+                replacement.last_checkin = ""
+                replacement.last_error = ""
+                replacement.cooldown_until = 0
+            with _SAVE_LOCK:
+                replacement.save(self.dir)
+                existing._superseded = True
+                existing.path = None
+                self.accounts[self.accounts.index(existing)] = replacement
+            from qoder_sign import SESSIONS
+            SESSIONS.invalidate(uid)
+            return replacement.public()
+
     def set_all_enabled(self, enabled, realm=None):
         with self._lock:
             for account in self.accounts:
@@ -3833,14 +4788,14 @@ class AccountPool(object):
                 account.save(self.dir)
 
     # -- 导入 / 导出 -------------------------------------------------------
-    def preview_import_rows(self, rows, realm=None, overwrite=False):
+    def preview_import_rows(self, rows, realm=None, overwrite=False, group=None):
         """报告 import_rows() 会做什么，不触碰账号池（Dry-Run）。"""
         preview = {"added": [], "updated": [], "skipped": [], "invalid": []}
         known = {a.uid for a in self.accounts}
         seen = set()
         for index, row in enumerate(rows):
             try:
-                kwargs = normalise_import_row(row, realm=realm)
+                kwargs = normalise_import_row(row, realm=realm, group=group)
             except Exception as exc:
                 preview["invalid"].append({"index": index + 1, "reason": str(exc)})
                 continue
@@ -3857,7 +4812,7 @@ class AccountPool(object):
             seen.add(uid)
         return preview
 
-    def import_rows(self, rows, realm=None, overwrite=False):
+    def import_rows(self, rows, realm=None, overwrite=False, group=None):
         """从导出/外部文档批量导入账号。
 
         返回报告：added / updated / skipped / invalid。
@@ -3867,7 +4822,7 @@ class AccountPool(object):
         seen = set()
         for index, row in enumerate(rows):
             try:
-                kwargs = normalise_import_row(row, realm=realm)
+                kwargs = normalise_import_row(row, realm=realm, group=group)
             except Exception as exc:
                 invalid.append({"index": index + 1, "reason": str(exc)})
                 continue
@@ -3896,21 +4851,20 @@ class AccountPool(object):
 
     # -- OAuth 设备授权登录 ------------------------------------------------
     @staticmethod
-    def _local_machine_id(realm):
+    def _local_machine_id(realm, vpc=None):
         """读取本机官方客户端的 machine_id（优先，保持设备一致），缺则生成。"""
-        cfg = get_realm_config(realm)
-        home = os.path.join(os.path.expanduser("~"), cfg["home_dir"], ".auth")
-        p = os.path.join(home, "machine_id")
-        try:
-            with open(p, encoding="utf-8") as fh:
-                mid = fh.read().strip()
-            if mid:
-                return mid
-        except Exception:
-            pass
+        for auth_dir in cli_auth_dirs(realm, vpc):
+            try:
+                with open(os.path.join(auth_dir, "machine_id"),
+                          encoding="utf-8") as fh:
+                    mid = fh.read().strip()
+                if mid:
+                    return mid
+            except Exception:
+                pass
         return str(uuid.uuid4())
 
-    def start_login(self, realm="cn", platform="CLI"):
+    def start_login(self, realm="cn", platform="CLI", vpc=None):
         """构造 PKCE 设备授权 URL（浏览器打开完成授权）。
 
         双区 URL 参数差异（官方逆向）：
@@ -3919,7 +4873,7 @@ class AccountPool(object):
           Intl : challenge, challenge_method, nonce(32-hex), client_id,
                  machine_id（新协议带 client_id/machine_id、不带 redirect_uri）
         """
-        cfg = get_realm_config(realm)
+        cfg = realm_config_for(realm, vpc)
         verifier, challenge = _make_pkce()
         nonce = uuid.uuid4().hex if not cfg["nonce_dashed"] else str(uuid.uuid4())
         q = {
@@ -3931,7 +4885,7 @@ class AccountPool(object):
             q["redirect_uri"] = cfg["redirect_uri"]
         if cfg.get("send_client_id"):
             q["client_id"] = cfg["client_id"]
-            q["machine_id"] = self._local_machine_id(realm)
+            q["machine_id"] = self._local_machine_id(realm, vpc)
         auth_url = cfg["website"] + "/device/selectAccounts?" + urllib.parse.urlencode(q)
         state = "qd-%d" % time.time_ns()
         with self._lock:
@@ -3941,9 +4895,11 @@ class AccountPool(object):
                 "nonce": nonce,
                 "region": realm,
                 "platform": platform,
+                "endpoint_config": dict(cfg),
+                "vpc_override": normalize_vpc_override(vpc),
             }
         return {"state": state, "authUrl": auth_url, "realm": realm,
-                "platform": platform}
+                "platform": platform, "vpcEndpoint": cfg.get("vpc_instance", "")}
 
     def poll_login(self, state):
         state = str(state or "").strip()
@@ -3957,7 +4913,7 @@ class AccountPool(object):
                 self.logins.pop(state, None)
             return {"status": "expired", "message": "login window expired - start again"}
         realm = info.get("region") or "cn"
-        cfg = get_realm_config(realm)
+        cfg = info.get("endpoint_config") or get_realm_config(realm)
         q = urllib.parse.urlencode({
             "nonce": info["nonce"],
             "verifier": info["verifier"],
@@ -4026,6 +4982,7 @@ class AccountPool(object):
             "nickname": nickname or ("u" + (uid[-8:] if uid else "")),
             "domain": cfg["domain"],
             "realm": realm,
+            "vpcEndpoint": info.get("vpc_override"),
             "platform": info.get("platform") or "CLI",
             "accessToken": token,
             "refreshToken": data.get("refresh_token") or "",
@@ -4036,8 +4993,10 @@ class AccountPool(object):
             "organizationId": org_id,
             "organizationName": org_name,
         })
-        self.add(account)
         with self._lock:
+            if self.logins.get(state) is not info:
+                return {"status": "cancelled", "message": "login was cancelled"}
+            self.add(account)
             self.logins.pop(state, None)
         return {"status": "ok", "account": account.public()}
 
@@ -4046,12 +5005,13 @@ class AccountPool(object):
             return self.logins.pop(state, None) is not None
 
     # -- PAT 导入 ----------------------------------------------------------
-    def import_pat(self, pat, realm="cn"):
+    def import_pat(self, pat, realm="cn", vpc=None):
         """导入 pt- 个人访问令牌：交换 jobToken 并拉取身份后入库。"""
         pat = str(pat or "").strip()
         if not pat.startswith("pt-"):
             raise ValueError("PAT must start with pt-")
-        cfg = get_realm_config(realm)
+        cfg = realm_config_for(realm, vpc)
+        endpoint_scope = _VpcEndpointScope(cfg)  # retain until exchange and save finish
         data = http_json(cfg["openapi"] + PATH_JOB_EXCHANGE,
                          data=json.dumps({"personal_token": pat}).encode(),
                          method="POST",
@@ -4085,6 +5045,7 @@ class AccountPool(object):
             "nickname": nickname or ("u" + (uid[-8:] if uid else uid[:8])),
             "domain": cfg["domain"],
             "realm": realm,
+            "vpcEndpoint": normalize_vpc_override(vpc),
             "platform": "CLI",
             "accessToken": token,
             "refreshToken": data.get("refresh_token") or "",
@@ -4175,6 +5136,29 @@ def _load_cli_user(realm, path, machine_key):
     return json.loads(pt.decode("utf-8"))
 
 
+def _scan_cli_auth_dirs(realm):
+    """Only public and explicitly configured instance paths, never all home dirs."""
+    directories = list(cli_auth_dirs(realm))
+    pool = globals().get("_ACTIVE_POOL")
+    if realm == "cn" and pool is not None:
+        with pool._lock:
+            instances = {a.vpc_endpoint for a in pool.accounts
+                         if a.realm == "cn" and a.vpc_endpoint}
+        for instance in sorted(instances):
+            for directory in cli_auth_dirs(realm, instance):
+                if directory not in directories:
+                    directories.append(directory)
+    return directories
+
+
+def _cli_path_vpc(realm, directory):
+    root = os.path.join(os.path.expanduser("~"), get_realm_config(realm)["home_dir"])
+    relative = Path(os.path.relpath(directory, root)).parts
+    if realm == "cn" and len(relative) == 3 and relative[0] == ".vpc" and relative[2] == ".auth":
+        return normalize_vpc_override(relative[1])
+    return None
+
+
 def scan_desktop_credentials():
     """只读探测本机双区已登录凭证。返回候选列表（不含任何明文令牌）。"""
     found = []
@@ -4223,9 +5207,12 @@ def scan_desktop_credentials():
             item["error"] = str(exc)
         found.append(item)
 
-        # 2) CLI 端 user / user.{profile}
-        auth_dir = os.path.join(os.path.expanduser("~"), cfg["home_dir"], ".auth")
-        if os.path.isdir(auth_dir):
+        # 2) CLI 端 user / user.{profile}（含 VPC 实例专属目录）
+        for auth_dir in _scan_cli_auth_dirs(realm):
+            if not os.path.isdir(auth_dir):
+                continue
+            path_vpc = _cli_path_vpc(realm, auth_dir)
+            cli_cfg = realm_config_for(realm, path_vpc)
             machine_key = ""
             try:
                 with open(os.path.join(auth_dir, "machine_id"),
@@ -4246,7 +5233,8 @@ def scan_desktop_credentials():
                     "file": n,
                     "realm": realm,
                     "realmName": cfg["name"],
-                    "domain": cfg["domain"],
+                    "domain": cli_cfg["domain"],
+                    "vpcEndpoint": path_vpc,
                     "readable": False,
                     "valid": False,
                     "uid": "",
@@ -4298,10 +5286,14 @@ def import_desktop_credential(path=None, realm=None):
             break
     if target_realm not in REALM_CONFIGS:
         target_realm = "cn"
-    cfg = get_realm_config(target_realm)
+    imported_vpc = matched.get("vpcEndpoint") if matched else _cli_path_vpc(
+        target_realm, os.path.dirname(path))
+    cfg = realm_config_for(target_realm, imported_vpc)
 
     token = refresh = ""
     uid = nickname = ""
+    user_type = DEFAULT_USER_TYPE
+    org_id = org_name = ""
     exp = 0
     base = os.path.basename(path)
     if base == "auth.v1.dat":
@@ -4311,6 +5303,12 @@ def import_desktop_credential(path=None, realm=None):
         user = data.get("user") or {}
         uid = str(user.get("id") or "")
         nickname = str(user.get("name") or "")
+        user_type = (str(user.get("user_type") or user.get("userType") or "")
+                     or DEFAULT_USER_TYPE)
+        org_id = str(user.get("organization_id")
+                     or user.get("organizationId") or "")
+        org_name = str(user.get("organization_name")
+                       or user.get("organizationName") or "")
         try:
             import datetime
             exp = int(datetime.datetime.strptime(
@@ -4332,6 +5330,12 @@ def import_desktop_credential(path=None, realm=None):
         refresh = str(data.get("refresh_token") or "")
         uid = str(data.get("uid") or "")
         nickname = str(data.get("name") or "")
+        user_type = (str(data.get("user_type") or data.get("userType") or "")
+                     or DEFAULT_USER_TYPE)
+        org_id = str(data.get("organization_id")
+                     or data.get("organizationId") or "")
+        org_name = str(data.get("organization_name")
+                       or data.get("organizationName") or "")
         exp = normalize_epoch(data.get("expire_time"))
 
     if not token:
@@ -4343,12 +5347,16 @@ def import_desktop_credential(path=None, realm=None):
         "nickname": nickname or uid[:8],
         "domain": cfg["domain"],
         "realm": target_realm,
+        "vpcEndpoint": imported_vpc,
         "platform": "CLI",
         "accessToken": token,
         "refreshToken": refresh,
         "expiresAt": exp or (int(time.time()) + 30 * 86400),
         "source": "desktop-app",
         "enabled": True,
+        "userType": user_type,
+        "organizationId": org_id,
+        "organizationName": org_name,
     })
     return add_to_pool(account)
 
@@ -4421,7 +5429,12 @@ def _coerce_account_rows(blob):
     return out, ""
 
 
-def normalise_import_row(row, realm=None):
+def normalize_import_account(row, realm=None, group=None):
+    """Compatibility spelling for import callers."""
+    return normalise_import_row(row, realm=realm, group=group)
+
+
+def normalise_import_row(row, realm=None, group=None):
     """把一行导入数据规整成 Account kwargs；无可用凭证时 raise ValueError。
 
     运行期字段（cooldownUntil/lastError/credits/lastCheckin/plan）不随导入采信：
@@ -4442,19 +5455,35 @@ def normalise_import_row(row, realm=None):
     detected = str(realm or pick("realm") or "").strip().lower()
     if detected not in ("cn", "intl"):
         detected = detect_realm_from_domain(pick("domain"))
-    cfg = get_realm_config(detected)
+    endpoint = None
+    for layer in (row, auth, profile):
+        if isinstance(layer, dict) and "vpcEndpoint" in layer:
+            endpoint = normalize_vpc_override(layer["vpcEndpoint"])
+            break
+    else:
+        domain = str(pick("domain") or "")
+        if detected == "cn" and domain.lower().endswith("." + VPC_DOMAIN_SUFFIX):
+            endpoint = normalize_vpc_override(domain)
+    cfg = realm_config_for(detected, endpoint)
     raw_uid = str(pick("uid") or "").strip()
     uid = re.sub(r"[^A-Za-z0-9_-]", "_", raw_uid).strip("_ ")
     if not uid:
         uid = "p-" + uuid.uuid4().hex[:24]
+    elif is_reserved_account_uid(uid):
+        # issue #131-4：第三方账号文档可能带这种记录；明确拒绝，
+        # 而不是静默改名（改名会让用户以为导入成功却多出一个假号）。
+        raise ValueError("uid %r is reserved by system files; rename the "
+                         "record before importing" % uid)
     exp = normalize_epoch(pick("expiresAt"))
     if not exp:
         exp = int(time.time()) + 3600
     return {
         "uid": uid,
         "nickname": str(pick("nickname") or ""),
-        "domain": str(pick("domain") or cfg["domain"]),
+        "group": str(group if group is not None else pick("group") or "").strip(),
+        "domain": cfg["domain"],
         "realm": detected,
+        "vpcEndpoint": endpoint,
         "platform": str(pick("platform") or "CLI"),
         "accessToken": token,
         "refreshToken": str(pick("refreshToken") or ""),

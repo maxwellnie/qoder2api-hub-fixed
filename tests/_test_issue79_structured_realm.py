@@ -18,7 +18,7 @@ None，而该函数 auto 模式的第一道闸是 `if (realm or "") != "cn": ret
 2) 行为断言（直接对函数做真值表）：
    - realm="cn" + dfmodel / deepseek → True；
    - realm=None → False（回归本体，用来证明修复点是「喂对 realm」）；
-   - realm="intl" → False（INTL 仍排除在 auto 之外）；
+   - realm="intl" → True（已验证国际区结构化历史）；
    - tool id 不齐 → False（fail-safe 不变）；
    - QD_STRUCTURED_TOOL_HISTORY 的 off / on 三态语义不变。
 
@@ -109,9 +109,11 @@ check("cn + dfmodel → True", _enabled("cn") is True)
 check("cn + deepseek 前缀 → True",
       _enabled("cn", model="deepseek-v4", key="deepseek-v4") is True)
 check("realm=None → False（回归本体）", _enabled(None) is False)
-check("intl + dfmodel → False（INTL 仍排除）", _enabled("intl") is False)
-check("cn + 非白名单模型 → False",
-      _enabled("cn", model="Kimi-K2", key="kimi") is False)
+check("intl + dfmodel → True（避免文本化回声）", _enabled("intl") is True)
+check("cn + Kimi → True（#153 原生历史）",
+      _enabled("cn", model="Kimi-K2", key="kimi") is True)
+check("cn + 未知 provider 仍排除",
+      _enabled("cn", model="unknown-fixture", key="unknown-fixture") is False)
 check("cn + tool id 不齐 → False（fail-safe）", _enabled("cn", ids_ok=False) is False)
 
 print("\n[issue79] 三态开关")

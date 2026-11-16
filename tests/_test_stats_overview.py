@@ -16,15 +16,22 @@ print("[stats] 后端聚合")
 _tmp = tempfile.mkdtemp(prefix="stats-")
 _log = os.path.join(_tmp, "usage.jsonl")
 _now = time.time()
+# 时间无关夹具（#70 同款教训）：把「今天的行」钉在本地零点之后，
+# 而不是 now-5h —— 否则在本地零点附近跑，部分行会掉进昨天，
+# 热力图峰值/活跃天数随跑测时刻漂移（CI 03:31 UTC 就红过）。
+_lt = time.localtime(_now)
+_midnight = time.mktime((_lt.tm_year, _lt.tm_mon, _lt.tm_mday, 0, 0, 0, 0, 0, -1))
+_today_at = lambda i: _midnight + 60 * (i + 1)      # 今天 00:01, 00:02 ...
+_yday_at = lambda i: _midnight - 3600 - 60 * i      # 昨天 23:00 起
 _rows = []
 # 3 天、3 个模型（两家厂商）、含 1 条错误行
 for i in range(5):
-    _rows.append({"at": _now - i * 3600, "iso": "", "model": "claude-4-sonnet",
+    _rows.append({"at": _today_at(i), "iso": "", "model": "claude-4-sonnet",
                   "prompt_tokens": 1000, "completion_tokens": 100,
                   "total_tokens": 1100, "cached_tokens": 600,
                   "account": "acct-1", "realm": "cn"})
 for i in range(3):
-    _rows.append({"at": _now - 86400 - i * 60, "iso": "", "model": "gpt-5",
+    _rows.append({"at": _yday_at(i), "iso": "", "model": "gpt-5",
                   "prompt_tokens": 500, "completion_tokens": 50,
                   "total_tokens": 550, "cached_tokens": 0,
                   "account": "acct-2", "realm": "cn"})
@@ -105,18 +112,38 @@ check("有悬浮提示与 reduced-motion 支持",
 check("区间切换有滑动指示器",
       "statSegPill" in _dash and "seg-pill" in _dash)
 check("数字滚动只在首屏/换区间（轮询不重播）",
-      "let statAnimate = true;" in _dash and "statAnimate = false;" in _dash)
+      "let statAnimateOnce = true;" in _dash
+      and "statAnimateOnce = !!force || !statData;" in _dash
+      and "statAnimateOnce = false;" in _dash)
 check("统计接口已挂路由", "/usage/stats" in io.open(
       os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read())
 
 print("[stats] 目录/关键词")
-check("pageNavSections 会跳过 .hint（侧栏标签不带 ?）",
-      "clone.querySelectorAll('em, .hint')" in _dash)
+check("pageNavSections 会跳过 .hint-icon（侧栏标签不带 ?）",
+      "clone.querySelectorAll('em, .hint-icon')" in _dash)
 check("boot 对每步容错（否则页签初始化会被跳过）",
       "boot step failed:" in _dash)
 
-print("[stats] 顶栏吸顶只作用于 body>header")
+print("[stats] getElementById 字面量 id 必须真实存在")
 import re as _re
+# 回归护栏：v1.7.1 删掉性能矩阵容器后，refreshInner() 里仍留着
+# document.getElementById('perfMatrix').innerHTML = ... ，每 5 秒抛一次
+# TypeError。导入账号后接着调用的 refresh() 也抛，于是用户看到
+# 「导入失败: Cannot set properties of null」——其实账号已经导入成功了。
+_id_defs = set(_re.findall(r'id="([\w\-]+)"', _dash))
+_id_defs |= set(_re.findall(r"\.id\s*=\s*['\"]([\w\-]+)['\"]", _dash))
+_id_defs |= set(_re.findall(r"id:\s*['\"]([\w\-]+)['\"]", _dash))
+_refs = set(_re.findall(r"getElementById\(\s*['\"]([\w\-]+)['\"]\s*\)", _dash))
+# 只有「取到就直接赋属性」才会抛；写成 if(x) 判断或 || 兜底的允许悬空
+_unguarded = set(_re.findall(
+    r"getElementById\(\s*['\"]([\w\-]+)['\"]\s*\)\s*\.\s*"
+    r"(?:innerHTML|textContent|className|style|value|checked|disabled|classList)",
+    _dash))
+_dangling = sorted(_unguarded - _id_defs)
+check("没有「指向不存在 id 又直接赋属性」的 getElementById（引用 %d 个 id）" % len(_refs),
+      not _dangling, "悬空: " + ", ".join(_dangling))
+
+print("[stats] 顶栏吸顶只作用于 body>header")
 check("顶栏规则已收窄为 body>header（面板内的 <header> 不再吸顶）",
       "body>header{" in _dash and _re.search(r'(^|\n)header\{', _dash) is None)
 check("面板标题显式清掉吸顶/层级",

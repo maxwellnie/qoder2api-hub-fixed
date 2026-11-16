@@ -67,9 +67,9 @@ check("#60f 上游 key `dfmodel` 命中结构化直传（此前只写 deepseek �
 check("#60f deepseek-* 仍命中", P.structured_tool_history_enabled(
     model="deepseek-v4-flash", model_key="deepseek-v4-flash",
     realm="cn", messages=_msgs) is True)
-check("#60f 未验证的 provider 仍排除（kimi）",
+check("#153 Kimi 不再走双层 JSON 文本历史",
       P.structured_tool_history_enabled(model="kimi-k2", model_key="kimi-k2",
-                                        realm="cn", messages=_msgs) is False)
+                                        realm="cn", messages=_msgs) is True)
 
 # ---------------------------------------------------------------- marker 变体
 print("[60f] marker 括号变体")

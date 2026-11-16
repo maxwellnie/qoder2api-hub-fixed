@@ -127,7 +127,7 @@ def fetch_task_view(account):
             "task_code": "daily_checkin_legacy",
             "name": "每日签到（旧活动批次）",
             "description": l_desc,
-            "jump_url": get_realm_config(account.realm)["website"] + "/",
+            "jump_url": qoder_accounts.account_realm_config(account)["website"] + "/",
             "status": l_status,
             "current": 1,
             "target": 1,
@@ -272,7 +272,7 @@ def _campaign_task_row(account, camp, summary):
       全部 CLAIMED              -> "claimed"  （今日已领取）
       其它/无活动               -> "not_accepted"
     """
-    website = get_realm_config(account.realm)["website"]
+    website = qoder_accounts.account_realm_config(account)["website"]
     jump = (camp.get("campaign_url") or website + "/activities") \
         if camp.get("ok") else website + "/activities"
     items = [{"key": c["campaign_key"] or c["campaign_id"],
@@ -661,8 +661,9 @@ def fetch_tasks_view(pool, realm=None, uid=None):
     if not pool or not pool.accounts:
         return {"tasks": [], "summary": {}, "accounts": [],
                 "msg": "未找到可用账号"}
+    # issue #102：签到/福利口径与推理解耦（禁用但开了开关的账号仍列出）
     eligible = [a for a in pool.accounts
-                if a.enabled and a.access_token
+                if a.checkin_eligible()
                 and (not realm or a.realm == realm)]
     if not eligible:
         return {"tasks": [], "summary": {}, "accounts": [],
@@ -748,9 +749,18 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
             logs.append(f"🎟 [{name}] {item['campaign']} 兑换码：{item['code']}"
                         f"（官方活动页可扫码兑换）")
     elif camp.get("blocked"):
+        # issue #130：单账号池也会遇到 SAME_PERSON_ALREADY_CLAIMED —— 上游按
+        # 「人」去重（同一机器身份算一人），不是「池里还有别的号」。此时本轮
+        # 确实没有什么可领，继续每天重试只会重复被拒，所以：① 文案说人话并
+        # 透出原始 failureCode；② 盖本地签到章，避免调度器每轮重复打上游。
         codes = ", ".join(b.get("failure_code") or "?" for b in camp["blocked"])
-        logs.append(f"⚠ [{name}] 同人已领取：同一设备/身份下其他账号本轮已领"
-                    f"（服务端按人去重，{codes}），本号本轮不再发放")
+        logs.append(f"✓ [{name}] 本轮无需再领：上游按「人」去重（{codes}）"
+                    f"—— 该身份今天已领过（可能来自官方客户端/同一设备的其它账号），"
+                    f"单账号池也会出现这个结论，不是本号凭证问题")
+        try:
+            account._stamp_checkin()
+        except Exception:
+            pass
     elif camp.get("already"):
         keys = "、".join(qoder_accounts.campaign_label(c) for c in camp["already"])
         logs.append(f"✓ [{name}] 今日活动奖励已领取（{keys}）")
@@ -765,7 +775,8 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
     else:
         logs.append(f"! [{name}] 活动平台查询失败：{camp.get('error')}")
 
-    if camp.get("claimed") or camp.get("already") or camp.get("ok"):
+    if (camp.get("claimed") or camp.get("already") or camp.get("ok")
+            or camp.get("blocked")):
         for item in camp.get("pending") or []:
             logs.append("⏳ [%s] %s：今日名额已发完，次日 10:00 后自动重试"
                         % (name, qoder_accounts.campaign_label(item)))
@@ -801,6 +812,9 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
                 "message": camp.get("message"),
                 "claimed": [qoder_accounts.campaign_label(c)
                             for c in camp.get("claimed") or []],
+                # issue #130：上游按人去重时的原始码（本轮无需再领，已盖签到章）
+                "blocked": [b.get("failure_code")
+                            for b in camp.get("blocked") or []],
                 "next_available_at": camp.get("next_available_at"),
                 "next_available_note": camp.get("next_available_note")}
 

@@ -22,6 +22,9 @@ const KEY_PART = slice('const KEY_ID_LABELS = {', 'async function refreshInner()
 const BYKEY_CONSTS = slice('let RECENT_SNAPSHOT = null;', 'function statDayStr(d){');
 const STATS = slice('function effortStatsByKey(rows){', 'function renderEffortByKey(){');
 const RENDER = slice('function renderEffortByKey(){', 'function statInit(){');
+// issue #98 起 renderEffortByKey 用 statSig 做重绘去重，eval 范围必须带上它
+// STAT_SIG 的声明已包含在 BYKEY_CONSTS 区间里，这里只补函数本体
+const SIG_PART = slice('function statSig(key, value){', 'function statKpiTiles(d){');
 check('锚点：Key/档位列区、by-key 常量区、汇总函数、趋势面板渲染区都抽到',
   KEY_PART.length > 400 && BYKEY_CONSTS.length > 60 && STATS.length > 200 && RENDER.length > 400);
 check('纯函数区（effortStatsByKey）不引用 document/window', !/document\.|window\./.test(STATS));
@@ -32,7 +35,7 @@ const body = { _html: '' };
 const doc = { getElementById: (id) => id === 'effortByKey'
   ? { set innerHTML(v){ body._html = v; }, get innerHTML(){ return body._html; } } : null };
 const api = new Function('document', 'esc', 'fmt', 'window',
-  KEY_PART + BYKEY_CONSTS + STATS + RENDER +
+  KEY_PART + BYKEY_CONSTS + STATS + SIG_PART + RENDER +
   '; return {keyCell:keyCell, keyDisplay:keyDisplay, effortCell:effortCell, renderEffortByKey:renderEffortByKey, setSnap:(s)=>{RECENT_SNAPSHOT=s;}};')(
   doc, esc, fmt, { API_KEY_ROWS: [{ id: 'abc123def456', name: 'DSH 本地测试' }] });
 const strip = h => String(h).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();

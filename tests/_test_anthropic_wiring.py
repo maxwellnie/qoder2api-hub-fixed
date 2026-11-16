@@ -8,6 +8,7 @@
   2) 形态决策**单点**（_qd_structured 下传，两处同源）；
   3) 流式守卫链 + **泄漏回归**（#9/#11 样本走新入口不得漏）。
 """
+import http.client
 import json
 import os
 import sys
@@ -81,10 +82,40 @@ def _post(path, headers, payload=None):
         return e.code, e.read().decode("utf-8", "replace")
 
 
+def _post_chunked(path, headers, payload):
+    """POST with Transfer-Encoding: chunked (Claude Code / undici does this)."""
+    body = json.dumps(payload).encode("utf-8")
+
+    def _chunks():
+        yield body[:11]
+        yield body[11:]
+
+    conn = http.client.HTTPConnection("127.0.0.1", _port, timeout=10)
+    try:
+        conn.request("POST", path, body=_chunks(), headers=headers,
+                     encode_chunked=True)
+        resp = conn.getresponse()
+        return resp.status, resp.read().decode("utf-8", "replace")
+    finally:
+        conn.close()
+
+
 _AK = {"x-api-key": "k", "anthropic-version": "2023-06-01"}
 _st1, _b1 = _post("/v1/messages/count_tokens", _AK)
 check("count_tokens 用 x-api-key 能过鉴权（200）且返回 Anthropic 形状",
       _st1 == 200 and json.loads(_b1).get("input_tokens", 0) > 0, (_st1, _b1))
+# 回归：大请求体会被客户端切成 chunked。只读 Content-Length 时 body 变成空
+# 对象，入口会误报 "messages is required"（见 qoder_proxy._read_chunked_body）。
+_st3, _b3 = _post_chunked(
+    "/v1/messages", _AK,
+    {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+check("chunked /v1/messages 的 body 被解析（缺 max_tokens 而不是缺 messages）",
+      _st3 == 400 and "max_tokens is required" in _b3, (_st3, _b3[:160]))
+_st4, _b4 = _post_chunked(
+    "/v1/messages/count_tokens", _AK,
+    {"model": "m", "messages": [{"role": "user", "content": "chunked body"}]})
+check("chunked count_tokens 不再按空 body 估算（input_tokens > 0）",
+      _st4 == 200 and json.loads(_b4).get("input_tokens", 0) > 0, (_st4, _b4[:160]))
 _st2, _b2 = _post("/v1/messages", _AK)
 check("messages 用 x-api-key 不再是 401/404（已过鉴权与路由，进入上游打开）",
       _st2 not in (401, 404), (_st2, _b2[:120]))
@@ -176,8 +207,13 @@ def _run_new_entry(frames, allowed):
             P.iter_inner_sse(_Resp(frames), holder=holder),
             allowed_names=allowed),
         lambda b: None)
-    return "".join(f.decode("utf-8")
-                   for f in AN.stream_anthropic_events(inner, "m", holder))
+    out = []
+    try:
+        for frame in AN.stream_anthropic_events(inner, "m", holder):
+            out.append(frame.decode("utf-8"))
+    except P.EmptyToolEcho as exc:
+        out.append(AN.anthropic_error_frame(exc.detail).decode("utf-8"))
+    return "".join(out)
 
 
 _M = P.LEAK_MARKER
@@ -198,8 +234,9 @@ def _split_frames(text, cuts=2):
 
 
 _out9 = _run_new_entry(_split_frames(_TRUNC9), {"terminal"})
-check("泄漏回归 · issue#9（截断的 marker+JSON 回声）-> 事件流里无标记",
-      _M not in _out9 and "工具结果" not in _out9)
+check("泄漏回归 · 截断回声不能静默结束：发 error，且无标记与成功收尾",
+      _M not in _out9 and "工具结果" not in _out9
+      and "event: error" in _out9 and "event: message_stop" not in _out9)
 _out11 = _run_new_entry(_split_frames(_TR11), {"terminal"})
 check("泄漏回归 · issue#11（[工具结果] 回声块）-> 事件流里无标记",
       "[工具结果" not in _out11 and _M not in _out11)
