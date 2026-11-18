@@ -8578,6 +8578,44 @@ def _envelope_retry_wait(exc, attempt):
     return attempt
 
 
+def _reopen_with_visible_queue(handler, flavor, exc, reopen, model=""):
+    """SSE 信封排队（403/10605）的 visible 等待：发 qoder_queue 进度帧再重开。
+
+    此前流内 10605 只走静默 time.sleep + open_upstream，客户端在 ~93s 内看不到
+    任何排队提示，最后才收到 429/502；HTTP 层 #87 的 visible 排队帧完全没有
+    用上。这里把两条路径统一：仍沿用 should_retry_envelope 的轮次上限，但把
+    「等待 + 重开」委托给 visible_queue_acquire，使其每轮 emit(queue) 亮给
+    客户端，超预算发 timeout/error 并由调用方收尾。
+
+    返回 (reopen_result, handled)：handled=True 表示本函数已完整处理这一轮
+    （调用方应立即 continue / return），False 表示不是排队或不是 visible，
+    调用方继续走原有静默重试语义。
+    """
+    if (queue_mode() != "visible" or not handler or
+            _envelope_queue_wait(exc) <= 0):
+        return None, False
+    handler._sse_begin()
+    q0 = time.time()
+
+    def _emit(kind, info):
+        info = dict(info or {})
+        info["model"] = model or info.get("model") or ""
+        if kind == "queue":
+            handler._queue_notice(flavor, info)
+        else:
+            handler._queue_error_frame(
+                flavor, info.get("message") or QUEUE_MSG_FAIL_ZH % (
+                    int(info.get("waited_seconds") or 0),
+                    int(info.get("budget_seconds") or QUEUE_WAIT_BUDGET_SECS)),
+                info.get("waited_seconds") or int(time.time() - q0),
+                info.get("budget_seconds") or QUEUE_WAIT_BUDGET_SECS)
+
+    seed = UpstreamQueued(_envelope_queue_wait(exc), exc.detail,
+                          waited=max(0, _envelope_queue_wait(exc) - 1))
+    got = visible_queue_acquire(seed, reopen, _emit, started=q0)
+    return got, True
+
+
 def _take_image_retry(usage_ctx):
     """One shared image-conversion retry across HTTP and SSE for a request."""
     if not isinstance(usage_ctx, dict):
@@ -13970,24 +14008,36 @@ class Handler(BaseHTTPRequestHandler):
                                        min(attempts + 1, _queue_budget()),
                                        _queue_budget()),
                                     level="WARN", tag="chat")
-                                time.sleep(_envelope_retry_wait(exc, attempts))
-                                if _is_image_conversion_timeout(exc.detail):
-                                    cur.close()  # Release team concurrency before reopening.
-                                try:
+                                _image_reopen = _is_image_conversion_timeout(exc.detail)
+
+                                def _resp_reopen(_im=_image_reopen):
+                                    if _im:
+                                        cur.close()  # Release team concurrency before reopening.
                                     # 必须用转换后的 chat 请求体重开：原始
                                     # Responses 体的会话在 input 字段里，而
                                     # build_qoder_body 只读 messages -> 空会话。
-                                    cur2, account, _ = open_upstream(
+                                    return open_upstream(
                                         chat_req, session_key=session_key,
                                         target_realm=req_realm,
                                         usage_ctx=usage_ctx,
-                                        **({"only_account": account} if
-                                           _is_image_conversion_timeout(exc.detail) else {}))
-                                except Exception as rex:
-                                    log("responses reopen failed: %s"
-                                        % str(rex)[:160], level="WARN")
-                                    pump_exc = exc
-                                    break
+                                        **({"only_account": account} if _im else {}))
+
+                                _qres, _qhandled = _reopen_with_visible_queue(
+                                    self, "responses", exc, _resp_reopen, model=model)
+                                if _qhandled:
+                                    if _qres is None:
+                                        self._sse_end()
+                                        return
+                                    cur2, account, _ = _qres
+                                else:
+                                    time.sleep(_envelope_retry_wait(exc, attempts))
+                                    try:
+                                        cur2, account, _ = _resp_reopen()
+                                    except Exception as rex:
+                                        log("responses reopen failed: %s"
+                                            % str(rex)[:160], level="WARN")
+                                        pump_exc = exc
+                                        break
                                 if cur is not upstream:
                                     try:
                                         cur.close()
@@ -14556,21 +14606,33 @@ class Handler(BaseHTTPRequestHandler):
                                        min(attempts + 1, _queue_budget()),
                                        _queue_budget()),
                                     level="WARN", tag="chat")
-                                time.sleep(_envelope_retry_wait(exc, attempts))
-                                if _is_image_conversion_timeout(exc.detail):
-                                    cur.close()  # Release team concurrency before reopening.
-                                try:
-                                    cur2, account, _ = open_upstream(
+                                _image_reopen = _is_image_conversion_timeout(exc.detail)
+
+                                def _chat_reopen(_im=_image_reopen):
+                                    if _im:
+                                        cur.close()  # Release team concurrency before reopening.
+                                    return open_upstream(
                                         payload, session_key=session_key,
                                         target_realm=req_realm,
                                         usage_ctx=usage_ctx,
-                                        **({"only_account": account} if
-                                           _is_image_conversion_timeout(exc.detail) else {}))
-                                except Exception as rex:
-                                    log("chat reopen failed: %s"
-                                        % str(rex)[:160], level="WARN")
-                                    pump_exc = exc
-                                    break
+                                        **({"only_account": account} if _im else {}))
+
+                                _qres, _qhandled = _reopen_with_visible_queue(
+                                    self, "chat", exc, _chat_reopen, model=model)
+                                if _qhandled:
+                                    if _qres is None:
+                                        self._sse_end()
+                                        return
+                                    cur2, account, _ = _qres
+                                else:
+                                    time.sleep(_envelope_retry_wait(exc, attempts))
+                                    try:
+                                        cur2, account, _ = _chat_reopen()
+                                    except Exception as rex:
+                                        log("chat reopen failed: %s"
+                                            % str(rex)[:160], level="WARN")
+                                        pump_exc = exc
+                                        break
                                 if cur is not upstream:
                                     try:
                                         cur.close()
